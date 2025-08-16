@@ -224,7 +224,8 @@ app.post('/v1/auth/api-keys', async (req, res) => {
 app.get('/v1/catalog/networks', async (req, res) => {
   try {
     const snap = await database.ref('catalog/networks').once('value');
-    const networks = snap.val() ? Object.values(snap.val()) : [];
+    const networksObj = snap.val() || {};
+    const networks = Object.values(networksObj);
     res.json({ networks });
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch networks', details: err.message });
@@ -245,23 +246,17 @@ app.post('/v1/catalog/networks', async (req, res) => {
 
 app.get('/v1/catalog/bundles', async (req, res) => {
   const { network } = req.query;
-  if (!network) {
-    // Return all bundles for all networks as objects
+  try {
     const snap = await database.ref('catalog/bundles').once('value');
-    const bundles = snap.val() || {};
+    const bundlesObj = snap.val() || {};
+    let bundles = Object.values(bundlesObj);
+    if (network) {
+      bundles = bundles.filter(b => b.networkId === network);
+    }
     res.json({ bundles });
-    return;
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch bundles', details: err.message });
   }
-  // Return bundles for specific network as object with bundleId keys
-  const snap = await database.ref(`catalog/bundles/${network}`).once('value');
-  const bundlesObj = snap.val() || {};
-  // If bundlesObj is an array, convert to object with index keys
-  let bundles = bundlesObj;
-  if (Array.isArray(bundlesObj)) {
-    bundles = {};
-    bundlesObj.forEach((b, i) => { if (b && b.bundleId) bundles[b.bundleId] = b; else bundles[i] = b; });
-  }
-  res.json({ network, bundles });
 });
 
 // Admin: Update bundles for a network
@@ -284,8 +279,9 @@ app.post('/v1/catalog/bundles', async (req, res) => {
 
 // --- Wallet Endpoints ---
 app.get('/v1/wallet', apiAuth, async (req, res) => {
-  const balance = req.userData.walletBalance || 0;
-  res.json({ balance, currency: "GHS" });
+  const snap = await database.ref(`wallets/${req.userId}`).once('value');
+  const wallet = snap.val() || { balance: 0 };
+  res.json({ balance: wallet.balance, currency: 'GHS' });
 });
 
 app.post('/v1/wallet/topup/initiate', apiAuth, async (req, res) => {
@@ -297,74 +293,71 @@ app.post('/v1/wallet/topup/initiate', apiAuth, async (req, res) => {
 });
 
 // --- Orders: Buy Bundle ---
-app.post('/v1/orders/bundles', apiAuth, idempotency, rateLimiter, async (req, res) => {
-  const { network, bundleId, msisdn } = req.body;
-  if (!network || !bundleId || !msisdn) {
-    return res.status(400).json({ success: false, error: { code: "BAD_INPUT", message: "Missing required fields" } });
+app.post('/v1/orders', apiAuth, async (req, res) => {
+  const { bundleId, phoneNumber } = req.body;
+  if (!bundleId || !phoneNumber) {
+    return res.status(400).json({ error: 'Missing bundleId or phoneNumber' });
   }
-  // Validate network
-  if (!["mtn", "at", "telecel"].includes(network)) {
-    return res.status(400).json({ success: false, error: { code: "UNSUPPORTED_NETWORK", message: "Network not supported" } });
-  }
-  // Validate bundle
-  const bundleSnap = await database.ref(`catalog/bundles/${network}/${bundleId}`).once('value');
+  // Fetch bundle
+  const bundleSnap = await database.ref(`catalog/bundles/${bundleId}`).once('value');
   const bundle = bundleSnap.val();
   if (!bundle) {
-    return res.status(400).json({ success: false, error: { code: "BUNDLE_NOT_FOUND", message: "Bundle not found" } });
+    return res.status(404).json({ error: 'Bundle not found' });
   }
-  const price = bundle.price;
-  // Check wallet
-  const wallet = req.userData.walletBalance || 0;
-  if (wallet < price) {
-    return res.status(400).json({ success: false, error: { code: "INSUFFICIENT_FUNDS", message: "Wallet balance too low" } });
+  // Fetch wallet
+  const walletSnap = await database.ref(`wallets/${req.userId}`).once('value');
+  const wallet = walletSnap.val() || { balance: 0 };
+  if (wallet.balance < bundle.price) {
+    return res.status(400).json({ error: 'Insufficient wallet balance' });
   }
-  // Debit wallet
-  await database.ref(`users/${req.userId}/walletBalance`).set(wallet - price);
-  // Call provider adapter (stub)
-  let providerRef = "FOSTER_DEMO";
-  let status = "paid";
-  // TODO: Integrate with real provider logic
-  // Save order
-  const orderId = database.ref(`orders/${req.userId}`).push().key;
-  await database.ref(`orders/${req.userId}/${orderId}`).set({
+  // Deduct wallet
+  const newBalance = wallet.balance - bundle.price;
+  await database.ref(`wallets/${req.userId}`).set({ balance: newBalance });
+  // Create order
+  const orderId = database.ref('orders').push().key;
+  const order = {
     orderId,
-    network,
+    userId: req.userId,
     bundleId,
-    msisdn,
-    amount: price,
-    status,
-    providerRef,
-    createdAt: Date.now(),
-    idempotencyKey: req.headers['idempotency-key'],
-  });
-  // Save idempotency result
-  await database.ref(req.idempotencyPath).set({
-    success: true,
-    orderId,
-    status,
-    amount: price,
-    providerRef,
-    message: "Bundle sent",
-  });
-  res.json({ success: true, orderId, status, amount: price, providerRef, message: "Bundle sent" });
+    phoneNumber,
+    status: 'pending',
+    amount: bundle.price,
+    createdAt: Date.now()
+  };
+  await database.ref(`orders/${orderId}`).set(order);
+  // Log transaction
+  const txnId = database.ref('transactions').push().key;
+  const txn = {
+    txnId,
+    userId: req.userId,
+    amount: bundle.price,
+    bundleId,
+    status: 'success',
+    createdAt: Date.now()
+  };
+  await database.ref(`transactions/${txnId}`).set(txn);
+  res.json(order);
 });
 
 // --- Get Order Details ---
 app.get('/v1/orders/:orderId', apiAuth, async (req, res) => {
   const { orderId } = req.params;
-  const snap = await database.ref(`orders/${req.userId}/${orderId}`).once('value');
-  if (!snap.exists()) return res.status(404).json({ error: "Order not found" });
-  res.json(snap.val());
+  const snap = await database.ref(`orders/${orderId}`).once('value');
+  if (!snap.exists()) return res.status(404).json({ error: 'Order not found' });
+  const order = snap.val();
+  if (order.userId !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+  res.json(order);
 });
 
 // --- Transactions Endpoint ---
 app.get('/v1/transactions', apiAuth, async (req, res) => {
   const { status, limit } = req.query;
-  const snap = await database.ref(`orders/${req.userId}`).orderByChild('createdAt').once('value');
-  let orders = snap.val() ? Object.values(snap.val()) : [];
-  if (status) orders = orders.filter(o => o.status === status);
-  if (limit) orders = orders.slice(-Number(limit));
-  res.json({ orders });
+  const snap = await database.ref('transactions').orderByChild('createdAt').once('value');
+  let txns = snap.val() ? Object.values(snap.val()) : [];
+  txns = txns.filter(t => t.userId === req.userId);
+  if (status) txns = txns.filter(t => t.status === status);
+  if (limit) txns = txns.slice(-Number(limit));
+  res.json({ transactions: txns });
 });
 
 // ✅ Health Check
