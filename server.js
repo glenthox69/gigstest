@@ -155,6 +155,43 @@ app.post('/v1/auth/api-keys', async (req, res) => {
   res.json({ apiKey }); // Show once only
 });
 
+// --- List API Keys for User ---
+app.get('/v1/auth/api-keys', async (req, res) => {
+  const { userId } = req.query;
+  if (!userId) return res.status(400).json({ error: "Missing userId" });
+  const snap = await database.ref('apiKeys').orderByChild('userId').equalTo(userId).once('value');
+  const keys = [];
+  snap.forEach(child => {
+    const val = child.val();
+    keys.push({
+      keyHash: child.key,
+      createdAt: val.createdAt,
+      active: val.active,
+      apiKey: val.apiKey || null // Only show if stored, usually not
+    });
+  });
+  res.json({ keys });
+});
+
+// --- Delete API Key ---
+app.delete('/v1/auth/api-keys/:keyHash', async (req, res) => {
+  const { keyHash } = req.params;
+  if (!keyHash) return res.status(400).json({ error: "Missing keyHash" });
+  // Find the userId for this key
+  const keySnap = await database.ref(`apiKeys/${keyHash}`).once('value');
+  if (!keySnap.exists()) return res.status(404).json({ error: "API key not found" });
+  const { userId } = keySnap.val();
+  // Remove the key
+  await database.ref(`apiKeys/${keyHash}`).remove();
+  // If this was the user's current key, clear it from their user record
+  const userRef = database.ref(`users/${userId}`);
+  const userSnap = await userRef.once('value');
+  if (userSnap.exists() && userSnap.val().apiKeyHash === keyHash) {
+    await userRef.update({ apiKeyHash: null });
+  }
+  res.json({ success: true });
+});
+
 // --- Catalog Endpoints ---
 app.get('/v1/catalog/networks', (req, res) => {
   res.json({ networks: ["mtn", "at", "telecel"] });
