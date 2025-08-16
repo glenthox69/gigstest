@@ -145,6 +145,69 @@ async function updateUserWallet(userId, amount) {
 
 // API Routes
 // --- API Key Generation/Regeneration ---
+// --- Admin: Seed Bundles for All Networks ---
+app.post('/v1/catalog/bundles/seed', async (req, res) => {
+  // Only allow if a special admin API key is provided (for safety)
+  const adminKey = req.headers['x-admin-key'];
+  if (!adminKey || adminKey !== process.env.ADMIN_SEED_KEY) {
+    return res.status(403).json({ error: 'Forbidden: Invalid admin key' });
+  }
+
+  // Use the networkData structure from app.js
+  const networkData = {
+    mtn: {
+      prices: {
+        '1GB': 5.5, '2GB': 12, '3GB': 18, '4GB': 23, '5GB': 27, '6GB': 34, '8GB': 42, '10GB': 47, '15GB': 74, '20GB': 90
+      },
+      agentPrices: {
+        '1GB': 4.9, '2GB': 9.8, '3GB': 14.7, '4GB': 19.2, '5GB': 25, '6GB': 29, '8GB': 38.6, '10GB': 45, '15GB': 70, '20GB': 86, '30GB': 125, '50GB': 200, '100GB': 399
+      },
+      volumes: ['1GB', '2GB', '3GB', '4GB', '5GB', '6GB', '8GB', '10GB', '15GB', '20GB', '30GB', '50GB', '100GB']
+    },
+    at: {
+      prices: {
+        '1GB': 5, '2GB': 9, '3GB': 13, '4GB': 18, '5GB': 20, '6GB': 23, '7GB': 30, '8GB': 35, '9GB': 36, '10GB': 42, '15GB': 61.5, '20GB': 80, '40GB': 115, '50GB': 140
+      },
+      agentPrices: {
+        '1GB': 4.3, '2GB': 8.6, '3GB': 12.5, '4GB': 18, '5GB': 20.6, '6GB': 24.8, '7GB': 28.6, '8GB': 33, '10GB': 40.2, '15GB': 60.2
+      },
+      volumes: ['1GB', '2GB', '3GB', '4GB', '5GB', '6GB', '7GB', '8GB', '9GB', '10GB', '15GB', '20GB', '40GB', '50GB']
+    },
+    telecel: {
+      prices: {
+        '5GB': 28, '10GB': 47, '15GB': 65, '20GB': 85, '25GB': 104, '30GB': 130, '40GB': 165, '50GB': 193, '100GB': 390
+      },
+      agentPrices: {
+        '5GB': 23, '10GB': 42, '15GB': 60, '20GB': 80, '30GB': 117, '40GB': 157, '50GB': 187
+      },
+      volumes: ['5GB', '10GB', '15GB', '20GB', '25GB', '30GB', '40GB', '50GB', '100GB']
+    }
+  };
+
+  // Build bundles for each network
+  const bundles = {};
+  Object.keys(networkData).forEach(network => {
+    bundles[network] = {};
+    networkData[network].volumes.forEach(volume => {
+      bundles[network][volume] = {
+        bundleId: volume,
+        volume,
+        price: networkData[network].prices[volume] || null,
+        agentPrice: networkData[network].agentPrices[volume] || null,
+        network,
+        name: `${network.toUpperCase()} ${volume}`,
+      };
+    });
+  });
+
+  // Save to Firebase
+  try {
+    await database.ref('catalog/bundles').set(bundles);
+    res.json({ success: true, bundles });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to seed bundles', details: err.message });
+  }
+});
 app.post('/v1/auth/api-keys', async (req, res) => {
   const { userId } = req.body;
   if (!userId) return res.status(400).json({ error: "Missing userId" });
