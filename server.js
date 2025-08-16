@@ -155,56 +155,68 @@ app.post('/v1/auth/api-keys', async (req, res) => {
   res.json({ apiKey }); // Show once only
 });
 
-// --- List API Keys for User ---
-app.get('/v1/auth/api-keys', async (req, res) => {
-  const { userId } = req.query;
-  if (!userId) return res.status(400).json({ error: "Missing userId" });
-  const snap = await database.ref('apiKeys').orderByChild('userId').equalTo(userId).once('value');
-  const keys = [];
-  snap.forEach(child => {
-    const val = child.val();
-    keys.push({
-      keyHash: child.key,
-      createdAt: val.createdAt,
-      active: val.active,
-      apiKey: val.apiKey || null // Only show if stored, usually not
-    });
-  });
-  res.json({ keys });
-});
-
-// --- Delete API Key ---
-app.delete('/v1/auth/api-keys/:keyHash', async (req, res) => {
-  const { keyHash } = req.params;
-  if (!keyHash) return res.status(400).json({ error: "Missing keyHash" });
-  // Find the userId for this key
-  const keySnap = await database.ref(`apiKeys/${keyHash}`).once('value');
-  if (!keySnap.exists()) return res.status(404).json({ error: "API key not found" });
-  const { userId } = keySnap.val();
-  // Remove the key
-  await database.ref(`apiKeys/${keyHash}`).remove();
-  // If this was the user's current key, clear it from their user record
-  const userRef = database.ref(`users/${userId}`);
-  const userSnap = await userRef.once('value');
-  if (userSnap.exists() && userSnap.val().apiKeyHash === keyHash) {
-    await userRef.update({ apiKeyHash: null });
-  }
-  res.json({ success: true });
-});
-
 // --- Catalog Endpoints ---
-app.get('/v1/catalog/networks', (req, res) => {
-  res.json({ networks: ["mtn", "at", "telecel"] });
+
+// Fetch networks from Realtime DB
+app.get('/v1/catalog/networks', async (req, res) => {
+  try {
+    const snap = await database.ref('catalog/networks').once('value');
+    const networks = snap.val() ? Object.values(snap.val()) : [];
+    res.json({ networks });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch networks', details: err.message });
+  }
+});
+
+// Admin: Update networks in DB
+app.post('/v1/catalog/networks', async (req, res) => {
+  const { networks } = req.body;
+  if (!Array.isArray(networks)) return res.status(400).json({ error: 'Networks must be an array' });
+  try {
+    await database.ref('catalog/networks').set(networks);
+    res.json({ success: true, networks });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update networks', details: err.message });
+  }
 });
 
 app.get('/v1/catalog/bundles', async (req, res) => {
   const { network } = req.query;
-  if (!network || !["mtn", "at", "telecel"].includes(network)) {
-    return res.status(400).json({ success: false, error: { code: "BAD_INPUT", message: "Invalid or missing network parameter" } });
+  if (!network) {
+    // Return all bundles for all networks as objects
+    const snap = await database.ref('catalog/bundles').once('value');
+    const bundles = snap.val() || {};
+    res.json({ bundles });
+    return;
   }
+  // Return bundles for specific network as object with bundleId keys
   const snap = await database.ref(`catalog/bundles/${network}`).once('value');
-  const bundles = snap.val() ? Object.values(snap.val()) : [];
+  const bundlesObj = snap.val() || {};
+  // If bundlesObj is an array, convert to object with index keys
+  let bundles = bundlesObj;
+  if (Array.isArray(bundlesObj)) {
+    bundles = {};
+    bundlesObj.forEach((b, i) => { if (b && b.bundleId) bundles[b.bundleId] = b; else bundles[i] = b; });
+  }
   res.json({ network, bundles });
+});
+
+// Admin: Update bundles for a network
+app.post('/v1/catalog/bundles', async (req, res) => {
+  const { network, bundles } = req.body;
+  if (!network || (!Array.isArray(bundles) && typeof bundles !== 'object')) return res.status(400).json({ error: 'Missing network or bundles (array or object)' });
+  try {
+    // If bundles is array, convert to object with bundleId keys if possible
+    let bundlesToSave = bundles;
+    if (Array.isArray(bundles)) {
+      bundlesToSave = {};
+      bundles.forEach((b, i) => { if (b && b.bundleId) bundlesToSave[b.bundleId] = b; else bundlesToSave[i] = b; });
+    }
+    await database.ref(`catalog/bundles/${network}`).set(bundlesToSave);
+    res.json({ success: true, network, bundles: bundlesToSave });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update bundles', details: err.message });
+  }
 });
 
 // --- Wallet Endpoints ---
