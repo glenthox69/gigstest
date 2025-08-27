@@ -1,944 +1,1233 @@
-require("dotenv").config()
-const express = require("express")
-const cors = require("cors")
-const axios = require("axios")
-const bodyParser = require("body-parser")
-const admin = require("firebase-admin")
+import express from "express"
+import dotenv from "dotenv"
+import { fileURLToPath } from "url"
+import path from "path"
+import crypto from "crypto"
+import fs from "fs"
+import cors from "cors"
+import compression from "compression"
+
+dotenv.config()
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+
+const CONFIG = {
+  port: process.env.PORT || 3000,
+  frontendUrl: process.env.FRONTEND_URL || `http://localhost:${process.env.PORT || 3000}`,
+  baseUrl: process.env.BASE_URL || `http://localhost:${process.env.PORT || 3000}`,
+  hubnetApiKey: process.env.HUBNET_API_KEY,
+  paystackSecretKey: process.env.PAYSTACK_SECRET_KEY,
+  nodeEnv: process.env.NODE_ENV || "development",
+
+  maxRetries: 1,
+  baseDelay: 200,
+  maxDelay: 3000,
+  requestTimeout: 8000,
+  keepAliveTimeout: 65000,
+  headersTimeout: 66000,
+
+  rateLimitWindow: 3 * 60 * 1000,
+  rateLimitMax: 500,
+
+  maxMemoryUsage: 512 * 1024 * 1024,
+  cacheCleanupInterval: 60 * 1000,
+
+  maxSockets: 200,
+  maxFreeSockets: 50,
+}
+
+if (!CONFIG.hubnetApiKey || !CONFIG.paystackSecretKey) {
+  console.error("❌ Missing required environment variables")
+  process.exit(1)
+}
 
 const app = express()
-const port = process.env.PORT || 3000
 
-// Initialize Firebase Admin
-const serviceAccount = {
-  type: "service_account",
-  project_id: "gigshub-fec04",
-  private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
-  private_key: process.env.FIREBASE_PRIVATE_KEY ? process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n") : undefined,
-  client_email: process.env.FIREBASE_CLIENT_EMAIL,
-  client_id: process.env.FIREBASE_CLIENT_ID,
-  auth_uri: "https://accounts.google.com/o/oauth2/auth",
-  token_uri: "https://oauth2.googleapis.com/token",
-  auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
-  client_x509_cert_url: process.env.FIREBASE_CLIENT_EMAIL
-    ? `https://www.googleapis.com/robot/v1/metadata/x509/${process.env.FIREBASE_CLIENT_EMAIL}`
-    : undefined,
-}
-
-try {
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-    databaseURL: "https://gigshub-fec04-default-rtdb.firebaseio.com",
-  })
-  console.log("Firebase Admin initialized successfully")
-} catch (error) {
-  console.error("Firebase Admin initialization error:", error)
-}
-
-const database = admin.database()
-
-// Middleware
-app.use(
-      cors({
-        origin: ["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:5500", "http://127.0.0.1:5500", "https://gigshub.onrender.com"],
-        credentials: true,
-      }),
-    )
-app.use(bodyParser.json())
-app.use(bodyParser.urlencoded({ extended: true }))
-
-// Constants
-const FOSTER_API_KEY = process.env.FOSTER_API_KEY || "15532994719ccaad92f0121586ba734aba22defa"
-const FOSTER_BASE_URL = "https://agent.jaybartservices.com/api/v1"
-const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || "sk_live_ad8e5341397f8245d1b3ba9f1790769259ddd253"
-const PAYSTACK_PUBLIC_KEY = process.env.PAYSTACK_PUBLIC_KEY || "pk_live_15c0e3b8d8e8c6b2c8a8e8c6b2c8a8e8c6b2c8a8"
-
-// Foster API client setup
-const fosterAPI = axios.create({
-  baseURL: FOSTER_BASE_URL,
-  headers: {
-    "x-api-key": FOSTER_API_KEY,
-    Accept: "application/json",
-    "Content-Type": "application/json",
+// Enhanced logging utility
+const logger = {
+  info: (message, data = {}) => {
+    console.log(`[INFO] ${new Date().toISOString()} - ${message}`, data)
   },
-  timeout: 30000,
+  error: (message, error = {}, data = {}) => {
+    console.error(`[ERROR] ${new Date().toISOString()} - ${message}`, {
+      error: error.message || error,
+      stack: error.stack,
+      ...data,
+    })
+  },
+  warn: (message, data = {}) => {
+    console.warn(`[WARN] ${new Date().toISOString()} - ${message}`, data)
+  },
+  debug: (message, data = {}) => {
+    if (CONFIG.nodeEnv === "development") {
+      console.log(`[DEBUG] ${new Date().toISOString()} - ${message}`, data)
+    }
+  },
+}
+
+app.set("trust proxy", 1)
+
+app.use(
+  compression({
+    level: 3,
+    threshold: 256,
+    filter: (req, res) => {
+      if (req.headers["x-no-compression"]) return false
+      return compression.filter(req, res)
+    },
+  }),
+)
+
+const allowedOrigins = new Set([
+  CONFIG.frontendUrl,
+  "https://datawisegh.pro",
+  "https://datawise-f3e20.web.app",
+])
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.has(origin) || CONFIG.nodeEnv === "development") {
+        callback(null, true)
+      } else {
+        callback(null, false)
+      }
+    },
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "Cache-Control", "X-Requested-With", "Accept", "Origin"],
+    credentials: true,
+    maxAge: 86400,
+    optionsSuccessStatus: 204,
+  }),
+)
+
+app.use(
+  express.json({
+    limit: "256kb",
+    strict: true,
+    type: "application/json",
+  }),
+)
+
+app.use(
+  express.urlencoded({
+    extended: false,
+    limit: "256kb",
+    parameterLimit: 100,
+  }),
+)
+
+const securityHeaders = {
+  "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "DENY",
+  "X-XSS-Protection": "1; mode=block",
+  "Referrer-Policy": "strict-origin-when-cross-origin",
+  "X-Powered-By": "PBM-DataHub",
+  "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+  "X-DNS-Prefetch-Control": "off",
+}
+
+app.use((req, res, next) => {
+  Object.entries(securityHeaders).forEach(([key, value]) => {
+    res.setHeader(key, value)
+  })
+  next()
 })
 
-// Utility Functions
-// --- Crypto for API key generation and hashing ---
-const crypto = require('crypto');
+const rateLimitStore = new Map()
 
-function generateApiKey() {
-  return crypto.randomBytes(32).toString('hex'); // 64 chars
-}
+function rateLimit(req, res, next) {
+  const clientId = req.ip || "unknown"
+  const now = Date.now()
+  const windowStart = now - CONFIG.rateLimitWindow
 
-function hashApiKey(key) {
-  return crypto.createHash('sha256').update(key).digest('hex');
-}
-
-// --- API Key Auth Middleware ---
-async function apiAuth(req, res, next) {
-  const apiKey = req.headers['x-api-key'];
-  if (!apiKey) return res.status(401).json({ error: "Missing API key" });
-  const keyHash = hashApiKey(apiKey);
-  const keySnap = await database.ref('apiKeys/' + keyHash).once('value');
-  if (!keySnap.exists() || !keySnap.val().active) return res.status(403).json({ error: "Invalid API key" });
-  req.userId = keySnap.val().userId;
-  req.userData = (await database.ref('users/' + req.userId).once('value')).val();
-  next();
-}
-
-// --- Idempotency Middleware ---
-async function idempotency(req, res, next) {
-  const idKey = req.headers['idempotency-key'];
-  if (!idKey) return res.status(400).json({ error: "Missing Idempotency-Key header" });
-  const path = `idempotency/${req.userId}/${idKey}`;
-  const snap = await database.ref(path).once('value');
-  if (snap.exists()) {
-    return res.json(snap.val());
+  if (!rateLimitStore.has(clientId)) {
+    rateLimitStore.set(clientId, [])
   }
-  req.idempotencyPath = path;
-  next();
-}
 
-// --- Rate Limiting Middleware ---
-async function rateLimiter(req, res, next) {
-  const keyHash = hashApiKey(req.headers['x-api-key'] || '');
-  const now = new Date();
-  const bucket = `${now.getFullYear()}${String(now.getMonth()+1).padStart(2,'0')}${String(now.getDate()).padStart(2,'0')}${String(now.getHours()).padStart(2,'0')}${String(now.getMinutes()).padStart(2,'0')}`;
-  const path = `rateLimits/${keyHash}/${bucket}`;
-  const snap = await database.ref(path).once('value');
-  let count = snap.val() || 0;
-  if (count >= 60) return res.status(429).json({ success: false, error: { code: "RATE_LIMITED", message: "Try again later" } });
-  await database.ref(path).set(count + 1);
-  next();
-}
-function logTransaction(type, data) {
-  const timestamp = new Date().toISOString()
-  console.log(`[${timestamp}] ${type}:`, JSON.stringify(data, null, 2))
+  const requests = rateLimitStore.get(clientId)
+  const validRequests = requests.filter((time) => time > windowStart)
 
-  // Save to Firebase
-  database
-    .ref(`transaction_logs/${type}`)
-    .push({
-      ...data,
-      timestamp,
+  if (validRequests.length >= CONFIG.rateLimitMax) {
+    return res.status(429).json({
+      status: "error",
+      message: "Too many requests",
+      retryAfter: Math.ceil(CONFIG.rateLimitWindow / 1000),
     })
-    .catch((error) => {
-      console.error("Failed to log transaction to Firebase:", error)
+  }
+
+  validRequests.push(now)
+  rateLimitStore.set(clientId, validRequests)
+  next()
+}
+
+app.use(rateLimit)
+
+const publicDir = path.join(__dirname, "public")
+if (!fs.existsSync(publicDir)) {
+  fs.mkdirSync(publicDir, { recursive: true })
+}
+
+app.use(
+  express.static(publicDir, {
+    maxAge: CONFIG.nodeEnv === "production" ? "1d" : "1h",
+    etag: true,
+    lastModified: true,
+    setHeaders: (res, path) => {
+      if (path.endsWith(".html")) {
+        res.setHeader("Cache-Control", "no-cache")
+      }
+    },
+  }),
+)
+
+class TransactionStore {
+  constructor() {
+    this._store = new Map()
+    this._maxAge = 6 * 60 * 60 * 1000
+    this._maxSize = 2000
+    this.setupPeriodicCleanup()
+  }
+
+  setupPeriodicCleanup() {
+    setInterval(() => {
+      this.cleanup()
+      this.memoryCleanup()
+    }, CONFIG.cacheCleanupInterval)
+  }
+
+  memoryCleanup() {
+    if (this._store.size > this._maxSize) {
+      const entries = Array.from(this._store.entries())
+      entries.sort((a, b) => a[1].timestamp - b[1].timestamp)
+      const toDelete = entries.slice(0, this._store.size - this._maxSize)
+      toDelete.forEach(([key]) => this._store.delete(key))
+    }
+  }
+
+  has(reference) {
+    return this._store.has(reference)
+  }
+
+  add(reference, metadata = {}) {
+    this._store.set(reference, {
+      timestamp: Date.now(),
+      ...metadata,
     })
+    return this
+  }
+
+  get(reference) {
+    return this._store.get(reference)
+  }
+
+  cleanup(maxAgeMs = this._maxAge) {
+    const now = Date.now()
+    let count = 0
+
+    for (const [reference, metadata] of this._store.entries()) {
+      if (now - metadata.timestamp > maxAgeMs) {
+        this._store.delete(reference)
+        count++
+      }
+    }
+
+    return count
+  }
 }
 
-async function updateUserWallet(userId, amount) {
-  try {
-    const userRef = database.ref(`users/${userId}`)
-    const snapshot = await userRef.once("value")
-    const currentBalance = snapshot.val()?.walletBalance || 0
-    const newBalance = currentBalance + amount
+const processedTransactions = new TransactionStore()
 
-    await userRef.update({ walletBalance: newBalance })
-    return newBalance
-  } catch (error) {
-    console.error("Error updating wallet:", error)
-    throw error
+// Enhanced transaction locking mechanism
+const transactionLocks = new Map()
+
+function acquireTransactionLock(reference, timeout = 30000) {
+  if (transactionLocks.has(reference)) {
+    const lockTime = transactionLocks.get(reference)
+    if (Date.now() - lockTime < timeout) {
+      return false // Lock still active
+    }
+  }
+
+  transactionLocks.set(reference, Date.now())
+  return true
+}
+
+function releaseTransactionLock(reference) {
+  transactionLocks.delete(reference)
+}
+
+// Cleanup expired locks periodically
+setInterval(() => {
+  const now = Date.now()
+  const timeout = 30000 // 30 seconds
+
+  for (const [reference, lockTime] of transactionLocks.entries()) {
+    if (now - lockTime > timeout) {
+      transactionLocks.delete(reference)
+    }
+  }
+}, 60000) // Run every minute
+
+function generateReference(prefix = "DATA") {
+  const timestamp = Date.now()
+  const random = crypto.randomBytes(2).toString("hex")
+  return `${prefix}_${timestamp}_${random}`
+}
+
+class CircuitBreaker {
+  constructor(threshold = 3, timeout = 10000, name = "unknown") {
+    this.threshold = threshold
+    this.timeout = timeout
+    this.name = name
+    this.failureCount = 0
+    this.lastFailureTime = null
+    this.state = "CLOSED"
+    this.successCount = 0
+  }
+
+  async call(fn) {
+    if (this.state === "OPEN") {
+      if (Date.now() - this.lastFailureTime > this.timeout) {
+        this.state = "HALF_OPEN"
+        logger.info(`Circuit breaker ${this.name} transitioning to HALF_OPEN`)
+      } else {
+        logger.warn(`Circuit breaker ${this.name} is OPEN, rejecting request`)
+        throw new Error(`Service temporarily unavailable - ${this.name}`)
+      }
+    }
+
+    try {
+      const result = await fn()
+      this.onSuccess()
+      return result
+    } catch (error) {
+      this.onFailure()
+      throw error
+    }
+  }
+
+  onSuccess() {
+    this.failureCount = 0
+    this.successCount++
+
+    if (this.state === "HALF_OPEN") {
+      this.state = "CLOSED"
+      this.successCount = 0
+      logger.info(`Circuit breaker ${this.name} recovered to CLOSED`)
+    }
+  }
+
+  onFailure() {
+    this.failureCount++
+    this.lastFailureTime = Date.now()
+    this.successCount = 0
+
+    if (this.failureCount >= this.threshold) {
+      this.state = "OPEN"
+      logger.error(`Circuit breaker ${this.name} opened after ${this.failureCount} failures`)
+    }
+  }
+
+  getState() {
+    return {
+      state: this.state,
+      failureCount: this.failureCount,
+      successCount: this.successCount,
+      lastFailureTime: this.lastFailureTime,
+    }
   }
 }
 
-// API Routes
-// --- API Key Generation/Regeneration ---
-// --- Admin: Seed Bundles for All Networks ---
-app.post('/v1/catalog/bundles/seed', async (req, res) => {
-  // Only allow if a special admin API key is provided (for safety)
-  const adminKey = req.headers['x-admin-key'];
-  if (!adminKey || adminKey !== process.env.ADMIN_SEED_KEY) {
-    return res.status(403).json({ error: 'Forbidden: Invalid admin key' });
+const paystackCircuitBreaker = new CircuitBreaker(3, 10000, "paystack")
+const hubnetCircuitBreaker = new CircuitBreaker(3, 15000, "hubnet")
+
+const fetchWithRetry = async (url, options = {}, config = {}) => {
+  const {
+    maxRetries = CONFIG.maxRetries,
+    baseDelay = CONFIG.baseDelay,
+    maxDelay = CONFIG.maxDelay,
+    timeout = CONFIG.requestTimeout,
+    circuitBreaker = null,
+  } = config
+
+  let lastError = null
+
+  const executeRequest = async () => {
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const controller = new AbortController()
+        const timeoutId = setTimeout(() => controller.abort(), timeout)
+
+        const fetchOptions = {
+          ...options,
+          signal: controller.signal,
+          headers: {
+            "User-Agent": "PBM-DataHub/5.0",
+            Accept: "application/json",
+            Connection: "keep-alive",
+            ...options.headers,
+          },
+        }
+
+        logger.debug(`Making request to ${url}`, { attempt: attempt + 1, maxRetries: maxRetries + 1 })
+
+        const response = await fetch(url, fetchOptions)
+        clearTimeout(timeoutId)
+
+        if (!response.ok) {
+          const errorText = await response.text()
+          let errorData
+
+          try {
+            errorData = JSON.parse(errorText)
+          } catch {
+            errorData = { message: errorText || `HTTP ${response.status}` }
+          }
+
+          logger.error(`HTTP error ${response.status}`, errorData, { url, attempt })
+
+          if (response.status >= 400 && response.status < 500 && response.status !== 429) {
+            throw new Error(`Client error: ${errorData.message || response.status}`)
+          }
+
+          throw new Error(`Server error: ${errorData.message || response.status}`)
+        }
+
+        const contentType = response.headers.get("content-type")
+        let data
+
+        if (contentType && contentType.includes("application/json")) {
+          const text = await response.text()
+          data = JSON.parse(text)
+        } else {
+          const text = await response.text()
+          data = JSON.parse(text)
+        }
+
+        logger.debug(`Request successful`, { url, attempt: attempt + 1 })
+        return data
+      } catch (error) {
+        lastError = error
+
+        if (error.name === "AbortError") {
+          lastError = new Error("Request timeout")
+        } else if (error.message.includes("Failed to fetch")) {
+          lastError = new Error("Network error")
+        }
+
+        logger.error(`Request attempt ${attempt + 1} failed`, error, { url })
+
+        if (error.message.includes("Client error") || attempt === maxRetries) {
+          break
+        }
+
+        const delay = Math.min(baseDelay * Math.pow(1.5, attempt), maxDelay)
+        await new Promise((resolve) => setTimeout(resolve, delay))
+      }
+    }
+
+    throw lastError || new Error("Request failed")
   }
 
-  // Use the networkData structure from app.js
-  const networkData = {
-    mtn: {
-      prices: {
-        '1GB': 5.5, '2GB': 12, '3GB': 18, '4GB': 23, '5GB': 27, '6GB': 34, '8GB': 42, '10GB': 47, '15GB': 74, '20GB': 90
+  if (circuitBreaker) {
+    return circuitBreaker.call(executeRequest)
+  } else {
+    return executeRequest()
+  }
+}
+
+async function initializePaystackPayment(payload) {
+  return await fetchWithRetry(
+    "https://api.paystack.co/transaction/initialize",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${CONFIG.paystackSecretKey}`,
       },
-      agentPrices: {
-        '1GB': 4.9, '2GB': 9.8, '3GB': 14.7, '4GB': 19.2, '5GB': 25, '6GB': 29, '8GB': 38.6, '10GB': 45, '15GB': 70, '20GB': 86, '30GB': 125, '50GB': 200, '100GB': 399
-      },
-      volumes: ['1GB', '2GB', '3GB', '4GB', '5GB', '6GB', '8GB', '10GB', '15GB', '20GB', '30GB', '50GB', '100GB']
+      body: JSON.stringify(payload),
     },
-    at: {
-      prices: {
-        '1GB': 5, '2GB': 9, '3GB': 13, '4GB': 18, '5GB': 20, '6GB': 23, '7GB': 30, '8GB': 35, '9GB': 36, '10GB': 42, '15GB': 61.5, '20GB': 80, '40GB': 115, '50GB': 140
-      },
-      agentPrices: {
-        '1GB': 4.3, '2GB': 8.6, '3GB': 12.5, '4GB': 18, '5GB': 20.6, '6GB': 24.8, '7GB': 28.6, '8GB': 33, '10GB': 40.2, '15GB': 60.2
-      },
-      volumes: ['1GB', '2GB', '3GB', '4GB', '5GB', '6GB', '7GB', '8GB', '9GB', '10GB', '15GB', '20GB', '40GB', '50GB']
+    {
+      circuitBreaker: paystackCircuitBreaker,
+      timeout: 8000,
+      maxRetries: 2,
     },
-    telecel: {
-      prices: {
-        '5GB': 28, '10GB': 47, '15GB': 65, '20GB': 85, '25GB': 104, '30GB': 130, '40GB': 165, '50GB': 193, '100GB': 390
+  )
+}
+
+async function verifyPaystackPayment(reference) {
+  return await fetchWithRetry(
+    `https://api.paystack.co/transaction/verify/${reference}`,
+    {
+      headers: {
+        Authorization: `Bearer ${CONFIG.paystackSecretKey}`,
+        "Cache-Control": "no-cache",
       },
-      agentPrices: {
-        '5GB': 23, '10GB': 42, '15GB': 60, '20GB': 80, '30GB': 117, '40GB': 157, '50GB': 187
+    },
+    {
+      circuitBreaker: paystackCircuitBreaker,
+      timeout: 10000,
+      maxRetries: 3,
+    },
+  )
+}
+
+async function checkHubnetBalance() {
+  return await fetchWithRetry(
+    "https://console.hubnet.app/live/api/context/business/transaction/check_balance",
+    {
+      method: "GET",
+      headers: {
+        token: `Bearer ${CONFIG.hubnetApiKey}`,
+        "Content-Type": "application/json",
       },
-      volumes: ['5GB', '10GB', '15GB', '20GB', '25GB', '30GB', '40GB', '50GB', '100GB']
+    },
+    {
+      circuitBreaker: hubnetCircuitBreaker,
+      timeout: 8000,
+    },
+  )
+}
+
+async function processHubnetTransaction(payload, network) {
+  if (processedTransactions.has(payload.reference)) {
+    const metadata = processedTransactions.get(payload.reference)
+    if (metadata && metadata.hubnetResponse) {
+      logger.info(`Transaction already processed`, { reference: payload.reference })
+      return metadata.hubnetResponse
     }
-  };
-
-  // Build bundles for each network
-  const bundles = {};
-  Object.keys(networkData).forEach(network => {
-    bundles[network] = {};
-    networkData[network].volumes.forEach(volume => {
-      bundles[network][volume] = {
-        bundleId: volume,
-        volume,
-        price: networkData[network].prices[volume] || null,
-        agentPrice: networkData[network].agentPrices[volume] || null,
-        network,
-        name: `${network.toUpperCase()} ${volume}`,
-      };
-    });
-  });
-
-  // Save to Firebase
-  try {
-    await database.ref('catalog/bundles').set(bundles);
-    res.json({ success: true, bundles });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to seed bundles', details: err.message });
-  }
-});
-app.post('/v1/auth/api-keys', async (req, res) => {
-  const { userId } = req.body;
-  if (!userId) return res.status(400).json({ error: "Missing userId" });
-  const apiKey = generateApiKey();
-  const keyHash = hashApiKey(apiKey);
-  await database.ref(`apiKeys/${keyHash}`).set({ userId, active: true, createdAt: new Date().toISOString() });
-  await database.ref(`users/${userId}`).update({ apiKeyHash: keyHash, apiKeyCreated: new Date().toISOString(), status: "active" });
-  res.json({ apiKey }); // Show once only
-});
-
-// --- Catalog Endpoints ---
-
-// Fetch networks from Realtime DB
-app.get('/v1/catalog/networks', async (req, res) => {
-  try {
-    const snap = await database.ref('catalog/networks').once('value');
-    const networksObj = snap.val() || {};
-    const networks = Object.values(networksObj);
-    res.json({ networks });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch networks', details: err.message });
-  }
-});
-
-// Admin: Update networks in DB
-app.post('/v1/catalog/networks', async (req, res) => {
-  const { networks } = req.body;
-  if (!Array.isArray(networks)) return res.status(400).json({ error: 'Networks must be an array' });
-  try {
-    await database.ref('catalog/networks').set(networks);
-    res.json({ success: true, networks });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to update networks', details: err.message });
-  }
-});
-
-app.get('/v1/catalog/bundles', async (req, res) => {
-  const { network } = req.query;
-  try {
-    const snap = await database.ref('catalog/bundles').once('value');
-    const bundlesObj = snap.val() || {};
-    let bundles = Object.values(bundlesObj);
-    if (network) {
-      bundles = bundles.filter(b => b.networkId === network);
+    return {
+      status: true,
+      reason: "Already processed",
+      code: "transaction already processed",
+      message: "0000",
+      transaction_id: `TXN-${payload.reference}`,
+      reference: payload.reference,
+      data: {
+        status: true,
+        code: "0000",
+        message: "Order already processed.",
+      },
     }
-    res.json({ bundles });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch bundles', details: err.message });
   }
-});
 
-// Admin: Update bundles for a network
-app.post('/v1/catalog/bundles', async (req, res) => {
-  const { network, bundles } = req.body;
-  if (!network || (!Array.isArray(bundles) && typeof bundles !== 'object')) return res.status(400).json({ error: 'Missing network or bundles (array or object)' });
-  try {
-    // If bundles is array, convert to object with bundleId keys if possible
-    let bundlesToSave = bundles;
-    if (Array.isArray(bundles)) {
-      bundlesToSave = {};
-      bundles.forEach((b, i) => { if (b && b.bundleId) bundlesToSave[b.bundleId] = b; else bundlesToSave[i] = b; });
-    }
-    await database.ref(`catalog/bundles/${network}`).set(bundlesToSave);
-    res.json({ success: true, network, bundles: bundlesToSave });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to update bundles', details: err.message });
+  const apiUrl = `https://console.hubnet.app/live/api/context/business/transaction/${network}-new-transaction`
+
+  logger.info(`Processing Hubnet transaction`, { reference: payload.reference, network, apiUrl })
+
+  const data = await fetchWithRetry(
+    apiUrl,
+    {
+      method: "POST",
+      headers: {
+        token: `Bearer ${CONFIG.hubnetApiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    },
+    {
+      circuitBreaker: hubnetCircuitBreaker,
+      timeout: 15000,
+      maxRetries: 1,
+    },
+  )
+
+  if (
+    data.event === "charge.rejected" &&
+    data.status === "failed" &&
+    data.message &&
+    data.message.includes("insufficient")
+  ) {
+    logger.error(`Insufficient Hubnet balance`, { reference: payload.reference })
+    throw new Error("INSUFFICIENT_HUBNET_BALANCE")
   }
-});
 
-// --- Wallet Endpoints ---
-app.get('/v1/wallet', apiAuth, async (req, res) => {
-  const snap = await database.ref(`wallets/${req.userId}`).once('value');
-  const wallet = snap.val() || { balance: 0 };
-  res.json({ balance: wallet.balance, currency: 'GHS' });
-});
-
-app.post('/v1/wallet/topup/initiate', apiAuth, async (req, res) => {
-  const { amount, customerEmail } = req.body;
-  if (!amount || !customerEmail) return res.status(400).json({ error: "Missing amount or customerEmail" });
-  // Use your existing Paystack logic here
-  // ...existing code...
-  res.status(501).json({ error: "Not implemented in this demo. Use /api/paystack/initialize for now." });
-});
-
-// --- Orders: Buy Bundle ---
-app.post('/v1/orders', apiAuth, async (req, res) => {
-  const { bundleId, phoneNumber } = req.body;
-  if (!bundleId || !phoneNumber) {
-    return res.status(400).json({ error: 'Missing bundleId or phoneNumber' });
+  if (data.status === "failed") {
+    const errorMessage = data.message || data.reason || "Transaction failed"
+    logger.error(`Hubnet transaction failed`, { reference: payload.reference, error: errorMessage })
+    throw new Error(`Hubnet API error: ${errorMessage}`)
   }
-  // Fetch bundle
-  const bundleSnap = await database.ref(`catalog/bundles/${bundleId}`).once('value');
-  const bundle = bundleSnap.val();
-  if (!bundle) {
-    return res.status(404).json({ error: 'Bundle not found' });
-  }
-  // Fetch wallet
-  const walletSnap = await database.ref(`wallets/${req.userId}`).once('value');
-  const wallet = walletSnap.val() || { balance: 0 };
-  if (wallet.balance < bundle.price) {
-    return res.status(400).json({ error: 'Insufficient wallet balance' });
-  }
-  // Deduct wallet
-  const newBalance = wallet.balance - bundle.price;
-  await database.ref(`wallets/${req.userId}`).set({ balance: newBalance });
-  // Create order
-  const orderId = database.ref('orders').push().key;
-  const order = {
-    orderId,
-    userId: req.userId,
-    bundleId,
-    phoneNumber,
-    status: 'pending',
-    amount: bundle.price,
-    createdAt: Date.now()
-  };
-  await database.ref(`orders/${orderId}`).set(order);
-  // Log transaction
-  const txnId = database.ref('transactions').push().key;
-  const txn = {
-    txnId,
-    userId: req.userId,
-    amount: bundle.price,
-    bundleId,
-    status: 'success',
-    createdAt: Date.now()
-  };
-  await database.ref(`transactions/${txnId}`).set(txn);
-  res.json(order);
-});
 
-// --- Get Order Details ---
-app.get('/v1/orders/:orderId', apiAuth, async (req, res) => {
-  const { orderId } = req.params;
-  const snap = await database.ref(`orders/${orderId}`).once('value');
-  if (!snap.exists()) return res.status(404).json({ error: 'Order not found' });
-  const order = snap.val();
-  if (order.userId !== req.userId) return res.status(403).json({ error: 'Forbidden' });
-  res.json(order);
-});
+  processedTransactions.add(payload.reference, {
+    network,
+    phone: payload.phone,
+    volume: payload.volume,
+    hubnetResponse: data,
+    processedAt: new Date().toISOString(),
+  })
 
-// --- Transactions Endpoint ---
-app.get('/v1/transactions', apiAuth, async (req, res) => {
-  const { status, limit } = req.query;
-  const snap = await database.ref('transactions').orderByChild('createdAt').once('value');
-  let txns = snap.val() ? Object.values(snap.val()) : [];
-  txns = txns.filter(t => t.userId === req.userId);
-  if (status) txns = txns.filter(t => t.status === status);
-  if (limit) txns = txns.slice(-Number(limit));
-  res.json({ transactions: txns });
-});
+  logger.info(`Hubnet transaction successful`, { reference: payload.reference, transactionId: data.transaction_id })
 
-// ✅ Health Check
-app.get("/api/health", (req, res) => {
+  return data
+}
+
+app.get("/health", (req, res) => {
+  const memUsage = process.memoryUsage()
   res.json({
-    status: "OK",
+    status: "ok",
     timestamp: new Date().toISOString(),
-    service: "Gigs Hub API",
+    uptime: process.uptime(),
+    memory: `${Math.round(memUsage.heapUsed / 1024 / 1024)}MB`,
+    environment: CONFIG.nodeEnv,
+    services: {
+      paystack: paystackCircuitBreaker.getState(),
+      hubnet: hubnetCircuitBreaker.getState(),
+    },
+    processedTransactions: processedTransactions._store.size,
+    activeLocks: transactionLocks.size,
   })
 })
 
-// ✅ Check Console Balance
+app.get("/", (req, res) => {
+  res.json({
+    name: "PBM DATA HUB API",
+    version: "5.0.0",
+    status: "running",
+    timestamp: new Date().toISOString(),
+  })
+})
+
 app.get("/api/check-balance", async (req, res) => {
   try {
-    console.log("Checking console balance...")
-    const response = await fosterAPI.get("/check-console-balance")
-
-    logTransaction("balance_check", {
-      success: true,
-      data: response.data,
+    const balanceData = await checkHubnetBalance()
+    res.json({
+      status: "success",
+      data: balanceData,
+      timestamp: new Date().toISOString(),
     })
-
-    res.json(response.data)
   } catch (error) {
-    console.error("Balance check error:", error.response?.data || error.message)
-
-    logTransaction("balance_check_error", {
-      error: error.response?.data || error.message,
-    })
-
-    res.status(error.response?.status || 500).json({
-      error: error.response?.data?.error || "Failed to check balance",
-      message: "Console balance check failed",
+    logger.error("Failed to check balance", error)
+    res.status(500).json({
+      status: "error",
+      message: "Failed to retrieve balance",
+      timestamp: new Date().toISOString(),
     })
   }
 })
 
-// ✅ Fetch Networks
-app.get("/api/networks", async (req, res) => {
-  try {
-    console.log("Fetching networks...")
-    const response = await fosterAPI.get("/fetch-networks")
+app.post("/api/initiate-payment", async (req, res) => {
+  const { network, phone, volume, amount, email, fcmToken, paymentType, reference } = req.body
 
-    logTransaction("networks_fetch", {
-      success: true,
-      count: response.data.length,
-    })
+  logger.info("Payment initiation request", { paymentType, amount, email, reference })
 
-    res.json(response.data)
-  } catch (error) {
-    console.error("Networks fetch error:", error.response?.data || error.message)
-
-    logTransaction("networks_fetch_error", {
-      error: error.response?.data || error.message,
-    })
-
-    res.status(error.response?.status || 500).json({
-      error: error.response?.data?.error || "Failed to fetch networks",
-      message: "Networks fetch failed",
-    })
-  }
-})
-
-// ✅ Fetch Data Packages
-app.get("/api/packages", async (req, res) => {
-  try {
-    console.log("Fetching data packages...")
-    const response = await fosterAPI.get("/fetch-data-packages")
-
-    logTransaction("packages_fetch", {
-      success: true,
-      count: response.data.length,
-    })
-
-    res.json(response.data)
-  } catch (error) {
-    console.error("Packages fetch error:", error.response?.data || error.message)
-
-    logTransaction("packages_fetch_error", {
-      error: error.response?.data || error.message,
-    })
-
-    res.status(error.response?.status || 500).json({
-      error: error.response?.data?.error || "Failed to fetch packages",
-      message: "Packages fetch failed",
-    })
-  }
-})
-
-// ✅ Buy iShare Package (AirtelTigo)
-app.post("/api/buy-ishare", async (req, res) => {
-  const { recipient_msisdn, shared_bundle, order_reference, userId } = req.body
-
-  // Validation
-  if (!recipient_msisdn || !shared_bundle || !order_reference || !userId) {
-    return res.status(400).json({
-      success: false,
-      error: "Missing required fields",
-      required: ["recipient_msisdn", "shared_bundle", "order_reference", "userId"],
-    })
-  }
-
-  try {
-    console.log("Processing iShare purchase:", { recipient_msisdn, shared_bundle, order_reference })
-
-    const response = await fosterAPI.post("/buy-ishare-package", {
-      recipient_msisdn,
-      shared_bundle,
-      order_reference,
-    })
-
-    const result = {
-      success: true,
-      message: response.data.response_msg || "iShare package purchased successfully",
-      response_code: response.data.response_code,
-      vendorTranxId: response.data.vendorTranxId,
-      transaction_code: response.data.vendorTranxId,
+  if (paymentType === "wallet") {
+    if (!amount || !email) {
+      return res.status(400).json({
+        status: "error",
+        message: "Missing required payment data",
+      })
+    }
+  } else {
+    if (!network || !phone || !volume || !amount || !email) {
+      return res.status(400).json({
+        status: "error",
+        message: "Missing required payment data",
+      })
     }
 
-    logTransaction("ishare_purchase", {
-      userId,
-      recipient_msisdn,
-      shared_bundle,
-      order_reference,
-      response: response.data,
-      status: "success",
-    })
-
-    res.json(result)
-  } catch (error) {
-    console.error("iShare purchase error:", error.response?.data || error.message)
-
-    const errorMessage =
-      error.response?.data?.response_msg || error.response?.data?.message || "iShare package purchase failed"
-
-    logTransaction("ishare_purchase_error", {
-      userId,
-      recipient_msisdn,
-      shared_bundle,
-      order_reference,
-      error: error.response?.data || error.message,
-      status: "failed",
-    })
-
-    res.status(400).json({
-      success: false,
-      message: errorMessage,
-      response_code: error.response?.data?.response_code || "500",
-      error: error.response?.data || error.message,
-    })
-  }
-})
-
-// ✅ Buy Other Package (MTN, Telecel, etc.)
-app.post("/api/buy-bundle", async (req, res) => {
-  const { recipient_msisdn, network_id, shared_bundle, order_reference, userId } = req.body
-
-  // Validation
-  if (!recipient_msisdn || !network_id || !shared_bundle || !order_reference || !userId) {
-    return res.status(400).json({
-      success: false,
-      error: "Missing required fields",
-      required: ["recipient_msisdn", "network_id", "shared_bundle", "order_reference", "userId"],
-    })
-  }
-
-  try {
-    console.log("Processing bundle purchase:", { recipient_msisdn, network_id, shared_bundle, order_reference })
-
-    const response = await fosterAPI.post("/buy-other-package", {
-      recipient_msisdn,
-      network_id,
-      shared_bundle,
-    })
-
-    const result = {
-      success: true,
-      message: response.data.message || "Package purchased successfully",
-      transaction_code: response.data.transaction_code,
-      data: response.data,
+    if (!["mtn", "at", "big-time"].includes(network)) {
+      return res.status(400).json({
+        status: "error",
+        message: "Invalid network",
+      })
     }
 
-    logTransaction("bundle_purchase", {
-      userId,
-      recipient_msisdn,
-      network_id,
-      shared_bundle,
-      order_reference,
-      response: response.data,
-      status: "success",
-    })
-
-    res.json(result)
-  } catch (error) {
-    console.error("Bundle purchase error:", error.response?.data || error.message)
-
-    const errorMessage = error.response?.data?.message || "Bundle purchase failed"
-
-    logTransaction("bundle_purchase_error", {
-      userId,
-      recipient_msisdn,
-      network_id,
-      shared_bundle,
-      order_reference,
-      error: error.response?.data || error.message,
-      status: "failed",
-    })
-
-    res.status(error.response?.status || 400).json({
-      success: false,
-      message: errorMessage,
-      error: error.response?.data || error.message,
-    })
-  }
-})
-
-// ✅ Fetch iShare Transactions
-app.get("/api/ishare-transactions", async (req, res) => {
-  try {
-    console.log("Fetching iShare transactions...")
-    const response = await fosterAPI.get("/fetch-ishare-transactions")
-
-    logTransaction("ishare_transactions_fetch", {
-      success: true,
-      count: response.data.length,
-    })
-
-    res.json(response.data)
-  } catch (error) {
-    console.error("iShare transactions fetch error:", error.response?.data || error.message)
-
-    res.status(error.response?.status || 500).json({
-      error: error.response?.data?.error || "Failed to fetch iShare transactions",
-    })
-  }
-})
-
-// ✅ Fetch Other Network Transactions
-app.get("/api/other-transactions", async (req, res) => {
-  try {
-    console.log("Fetching other network transactions...")
-    const response = await fosterAPI.get("/fetch-other-network-transactions")
-
-    logTransaction("other_transactions_fetch", {
-      success: true,
-      count: response.data.length,
-    })
-
-    res.json(response.data)
-  } catch (error) {
-    console.error("Other transactions fetch error:", error.response?.data || error.message)
-
-    res.status(error.response?.status || 500).json({
-      error: error.response?.data?.error || "Failed to fetch other network transactions",
-    })
-  }
-})
-
-// ✅ Fetch Single iShare Transaction
-app.post("/api/ishare-transaction", async (req, res) => {
-  const { transaction_id } = req.body
-
-  if (!transaction_id) {
-    return res.status(400).json({ error: "Transaction ID is required" })
-  }
-
-  try {
-    console.log("Fetching iShare transaction:", transaction_id)
-    const response = await fosterAPI.post("/fetch-ishare-transaction", {
-      transaction_id,
-    })
-
-    res.json(response.data)
-  } catch (error) {
-    console.error("iShare transaction fetch error:", error.response?.data || error.message)
-
-    if (error.response?.status === 404) {
-      res.status(404).json({ message: "Transaction not found." })
-    } else {
-      res.status(error.response?.status || 500).json({
-        error: error.response?.data?.error || "Failed to fetch transaction",
+    if (!/^\d{10}$/.test(phone)) {
+      return res.status(400).json({
+        status: "error",
+        message: "Invalid phone number format",
       })
     }
   }
-})
 
-// ✅ Fetch Single Other Network Transaction
-app.post("/api/other-transaction", async (req, res) => {
-  const { transaction_id } = req.body
-
-  if (!transaction_id) {
-    return res.status(400).json({ error: "Transaction ID is required" })
-  }
-
-  try {
-    console.log("Fetching other network transaction:", transaction_id)
-    const response = await fosterAPI.post("/fetch-other-network-transaction", {
-      transaction_id,
+  const numAmount = Number(amount)
+  if (isNaN(numAmount) || numAmount <= 0 || numAmount > 10000) {
+    return res.status(400).json({
+      status: "error",
+      message: "Invalid amount",
     })
-
-    res.json(response.data)
-  } catch (error) {
-    console.error("Other network transaction fetch error:", error.response?.data || error.message)
-
-    if (error.response?.status === 404) {
-      res.status(404).json({ message: "Transaction not found." })
-    } else {
-      res.status(error.response?.status || 500).json({
-        error: error.response?.data?.error || "Failed to fetch transaction",
-      })
-    }
-  }
-})
-
-// ✅ Paystack - Initialize Payment
-app.post("/api/paystack/initialize", async (req, res) => {
-  const { email, amount, userId, depositAmount, charge } = req.body
-
-  if (!email || !amount || !userId || !depositAmount || typeof charge === 'undefined') {
-    return res.status(400).json({ error: "Missing required fields: email, amount, userId, depositAmount, charge" })
   }
 
   try {
-    console.log("Initializing Paystack payment:", { email, amount, userId, depositAmount, charge })
+    const prefix =
+      paymentType === "wallet"
+        ? "WALLET_DEPOSIT"
+        : network === "mtn"
+          ? "MTN_DATA"
+          : network === "at"
+            ? "AT_DATA"
+            : "BT_DATA"
 
-    const response = await axios.post(
-      "https://api.paystack.co/transaction/initialize",
-      {
-        email,
-        amount: Math.round(Number.parseFloat(amount) * 100), // Convert to pesewas
-        currency: "GHS",
-        metadata: {
-          userId,
-          depositAmount: Number.parseFloat(depositAmount),
-          charge: Number.parseFloat(charge),
-          totalAmount: Number.parseFloat(amount),
-          custom_fields: [
-            {
-              display_name: "Wallet Funding",
-              variable_name: "wallet_funding",
-              value: Number.parseFloat(depositAmount),
-            },
-            {
-              display_name: "Charge",
-              variable_name: "charge",
-              value: Number.parseFloat(charge),
-            },
-            {
-              display_name: "Total Amount",
-              variable_name: "total_amount",
-              value: Number.parseFloat(amount),
-            },
-          ],
-        },
-        channels: ["card", "bank", "ussd", "qr", "mobile_money", "bank_transfer"],
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
-          "Content-Type": "application/json",
-        },
-      },
-    )
+    const paymentReference = reference || generateReference(prefix)
+    const amountInKobo = Math.round(numAmount * 100)
 
-    const { reference, access_code, authorization_url } = response.data.data
-
-    logTransaction("paystack_initialize", {
-      userId,
+    const payload = {
+      amount: amountInKobo,
       email,
-      amount,
-      depositAmount,
-      charge,
-      reference,
-      success: true,
-    })
+      reference: paymentReference,
+      callback_url: CONFIG.frontendUrl,
+      metadata: {
+        paymentType: paymentType || "bundle",
+        fcmToken: fcmToken || null,
+        custom_fields: [
+          {
+            display_name: paymentType === "wallet" ? "Wallet Deposit" : "Data Bundle",
+            variable_name: paymentType === "wallet" ? "wallet_deposit" : "data_bundle",
+            value:
+              paymentType === "wallet"
+                ? `₵${numAmount} Wallet Deposit`
+                : `${volume}MB for ${phone} (${network.toUpperCase()})`,
+          },
+        ],
+      },
+    }
+
+    if (paymentType !== "wallet") {
+      payload.metadata.network = network
+      payload.metadata.phone = phone
+      payload.metadata.volume = volume
+    }
+
+    const data = await initializePaystackPayment(payload)
+
+    if (!data.status || !data.data) {
+      throw new Error("Payment initialization failed")
+    }
+
+    logger.info("Payment initialized successfully", { reference: paymentReference, amount: numAmount })
 
     res.json({
-      publicKey: PAYSTACK_PUBLIC_KEY,
-      reference,
-      accessCode: access_code,
-      authorizationUrl: authorization_url,
+      status: "success",
+      data: data.data,
+      timestamp: new Date().toISOString(),
     })
   } catch (error) {
-    console.error("Paystack initialization error:", error.response?.data || error.message)
-
-    logTransaction("paystack_initialize_error", {
-      userId,
-      email,
-      amount,
-      depositAmount,
-      charge,
-      error: error.response?.data || error.message,
-    })
-
+    logger.error("Payment initialization failed", error, { amount: numAmount, paymentType })
     res.status(500).json({
-      error: "Failed to initialize payment",
-      details: error.response?.data || error.message,
+      status: "error",
+      message: "Payment initialization failed",
+      timestamp: new Date().toISOString(),
     })
   }
 })
 
-// ✅ Paystack - Verify Payment
-app.get("/api/paystack/verify/:reference", async (req, res) => {
-  const { reference } = req.params
+app.post("/api/process-wallet-purchase", async (req, res) => {
+  const { userId, network, phone, volume, amount, email, fcmToken, transactionKey } = req.body
+
+  logger.info("Wallet purchase request", { userId, network, phone, volume, amount })
+
+  if (!userId || !network || !phone || !volume || !amount || !email) {
+    return res.status(400).json({
+      status: "error",
+      message: "Missing required data",
+    })
+  }
+
+  if (!["mtn", "at", "big-time"].includes(network)) {
+    return res.status(400).json({
+      status: "error",
+      message: "Invalid network",
+    })
+  }
+
+  if (!/^\d{10}$/.test(phone)) {
+    return res.status(400).json({
+      status: "error",
+      message: "Invalid phone number",
+    })
+  }
+
+  const numAmount = Number(amount)
+  const numVolume = Number(volume)
+
+  if (isNaN(numAmount) || numAmount <= 0 || isNaN(numVolume) || numVolume <= 0) {
+    return res.status(400).json({
+      status: "error",
+      message: "Invalid amount or volume",
+    })
+  }
 
   try {
-    console.log("Verifying Paystack payment:", reference)
+    const prefix = network === "mtn" ? "MTN_PBM" : network === "at" ? "AT_PBM" : "BT_WALLET"
+    const reference = generateReference(prefix)
 
-    // Prevent replay attacks: check if reference already processed
-    const refCheck = await database.ref(`paystack_references/${reference}`).once('value');
-    if (refCheck.exists()) {
-      logTransaction("paystack_verify_replay_attempt", { reference, message: "Reference already processed" });
-      return res.status(409).json({ error: "This payment reference has already been processed." });
+    const hubnetPayload = {
+      phone,
+      volume: numVolume.toString(),
+      reference,
+      referrer: phone,
     }
 
-    const response = await axios.get(`https://api.paystack.co/transaction/verify/${reference}`, {
-      headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` },
+    const hubnetData = await processHubnetTransaction(hubnetPayload, network)
+
+    logger.info("Wallet purchase successful", { reference, userId, network, phone, volume: numVolume })
+
+    res.json({
+      status: "success",
+      message: "Transaction completed successfully",
+      data: {
+        reference: reference,
+        amount: numAmount,
+        phone: phone,
+        volume: numVolume,
+        network: network,
+        timestamp: Date.now(),
+        transaction_id: hubnetData.transaction_id || hubnetData.data?.transaction_id || "N/A",
+        hubnetResponse: hubnetData,
+      },
+      timestamp: new Date().toISOString(),
+    })
+  } catch (hubnetError) {
+    logger.error("Wallet purchase failed", hubnetError, { userId, network, phone, volume: numVolume })
+
+    if (hubnetError.message === "INSUFFICIENT_HUBNET_BALANCE") {
+      return res.status(503).json({
+        status: "error",
+        errorCode: "INSUFFICIENT_HUBNET_BALANCE",
+        message: "Service provider has insufficient balance",
+        timestamp: new Date().toISOString(),
+      })
+    }
+
+    res.status(500).json({
+      status: "error",
+      message: "Failed to process data bundle",
+      timestamp: new Date().toISOString(),
+    })
+  }
+})
+
+// FIXED: Single, comprehensive payment verification endpoint
+app.get("/api/verify-payment/:reference", async (req, res) => {
+  const { reference } = req.params
+
+  if (!reference) {
+    return res.status(400).json({
+      status: "error",
+      message: "Missing payment reference",
+    })
+  }
+
+  logger.info("Payment verification request", { reference })
+
+  // Check if already processed in memory
+  if (processedTransactions.has(reference)) {
+    const metadata = processedTransactions.get(reference)
+    logger.info("Transaction already processed (memory)", { reference })
+    return res.json({
+      status: "success",
+      message: "Transaction already processed",
+      data: {
+        reference: reference,
+        alreadyProcessed: true,
+        processedAt: metadata.processedAt || new Date().toISOString(),
+        hubnetResponse: metadata.hubnetResponse || null,
+      },
+      timestamp: new Date().toISOString(),
+    })
+  }
+
+  // Acquire transaction lock to prevent race conditions
+  if (!acquireTransactionLock(reference)) {
+    logger.warn("Transaction lock conflict", { reference })
+    return res.status(409).json({
+      status: "error",
+      message: "Transaction is currently being processed",
+      retryAfter: 3,
+    })
+  }
+
+  try {
+    // Verify payment with Paystack
+    logger.debug("Verifying payment with Paystack", { reference })
+    const verifyData = await verifyPaystackPayment(reference)
+
+    if (!verifyData.status) {
+      logger.error("Paystack verification failed", { reference, response: verifyData })
+      return res.json({
+        status: "failed",
+        message: "Payment verification failed",
+        timestamp: new Date().toISOString(),
+      })
+    }
+
+    const paymentData = verifyData.data
+    logger.info("Paystack verification successful", {
+      reference,
+      status: paymentData.status,
+      amount: paymentData.amount,
     })
 
-    const paymentData = response.data.data
-    console.log("[Paystack verify] Full paymentData:", JSON.stringify(paymentData, null, 2))
+    if (paymentData.status === "success") {
+      const paymentType = paymentData.metadata?.paymentType || "bundle"
 
-    // Strict metadata validation for depositAmount
-    let userId = paymentData?.metadata?.userId
-    let depositAmount = paymentData?.metadata?.depositAmount
-    if ((!userId || !depositAmount) && paymentData?.metadata?.custom_fields) {
-      // Try to extract from custom_fields array
-      const userIdField = paymentData.metadata.custom_fields.find(f => f.display_name === 'Wallet Funding' || f.variable_name === 'wallet_funding')
-      if (userIdField) {
-        depositAmount = userIdField.value
-      }
-    }
-
-    // Only allow success status and correct channel
-    if (paymentData.status === "success" && paymentData.channel && ["card","bank","ussd","qr","mobile_money","bank_transfer"].includes(paymentData.channel)) {
-      if (!userId || !depositAmount) {
-        console.error("[Paystack verify] Missing userId or depositAmount in payment metadata:", paymentData.metadata)
-        logTransaction("paystack_verify_error", {
-          reference,
-          error: "Missing userId or depositAmount in payment metadata",
+      // Handle wallet deposits
+      if (paymentType === "wallet") {
+        processedTransactions.add(reference, {
+          type: "wallet_deposit",
+          amount: paymentData.amount / 100,
+          status: "success",
+          processedAt: new Date().toISOString(),
           metadata: paymentData.metadata,
         })
-        return res.status(400).json({ error: "Missing userId or depositAmount in payment metadata", metadata: paymentData.metadata })
+
+        logger.info("Wallet deposit verified", { reference, amount: paymentData.amount / 100 })
+
+        return res.json({
+          status: "success",
+          message: "Wallet deposit completed successfully",
+          data: {
+            reference: paymentData.reference,
+            amount: paymentData.amount / 100,
+            paymentType: "wallet",
+            timestamp: new Date(paymentData.paid_at).getTime(),
+          },
+          timestamp: new Date().toISOString(),
+        })
       }
 
-      // Mark reference as processed before updating wallet (atomicity)
-      await database.ref(`paystack_references/${reference}`).set({ processed: true, userId, depositAmount, timestamp: new Date().toISOString() });
+      // Handle data bundle purchases
+      const { phone, volume, network } = paymentData.metadata
+      if (!phone || !volume || !network) {
+        logger.error("Missing metadata for data bundle", { reference, metadata: paymentData.metadata })
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid payment metadata",
+          timestamp: new Date().toISOString(),
+        })
+      }
 
-      // Update user wallet with only depositAmount
-      const newBalance = await updateUserWallet(userId, Number.parseFloat(depositAmount))
-
-      logTransaction("paystack_verify", {
-        userId,
-        depositAmount: Number.parseFloat(depositAmount),
+      const hubnetPayload = {
+        phone,
+        volume: volume.toString(),
         reference,
-        newBalance,
-        status: "success",
-      })
+        referrer: phone,
+      }
 
-      res.json({
-        status: "success",
-        balance: newBalance,
-        amount: Number.parseFloat(depositAmount),
+      try {
+        logger.debug("Processing Hubnet transaction for verified payment", { reference, network })
+        const hubnetData = await processHubnetTransaction(hubnetPayload, network)
+
+        logger.info("Data bundle processing successful", {
+          reference,
+          transactionId: hubnetData.transaction_id,
+        })
+
+        return res.json({
+          status: "success",
+          message: "Transaction completed successfully",
+          data: {
+            reference: paymentData.reference,
+            amount: paymentData.amount / 100,
+            phone: paymentData.metadata.phone,
+            volume: paymentData.metadata.volume,
+            network: paymentData.metadata.network,
+            timestamp: new Date(paymentData.paid_at).getTime(),
+            transaction_id: hubnetData.transaction_id || hubnetData.data?.transaction_id || "N/A",
+            hubnetResponse: hubnetData,
+          },
+          timestamp: new Date().toISOString(),
+        })
+      } catch (hubnetError) {
+        logger.error("Hubnet processing failed for verified payment", hubnetError, { reference })
+
+        if (hubnetError.message === "INSUFFICIENT_HUBNET_BALANCE") {
+          return res.json({
+            status: "pending",
+            paymentStatus: "success",
+            hubnetStatus: "failed",
+            message: "Payment successful but service provider has insufficient balance",
+            data: {
+              reference: paymentData.reference,
+              amount: paymentData.amount / 100,
+              phone: paymentData.metadata.phone,
+              volume: paymentData.metadata.volume,
+              network: paymentData.metadata.network,
+              timestamp: new Date(paymentData.paid_at).getTime(),
+            },
+            timestamp: new Date().toISOString(),
+          })
+        }
+
+        return res.json({
+          status: "pending",
+          paymentStatus: "success",
+          hubnetStatus: "failed",
+          message: "Payment successful but data bundle processing failed",
+          data: {
+            reference: paymentData.reference,
+            amount: paymentData.amount / 100,
+            phone: paymentData.metadata.phone,
+            volume: paymentData.metadata.volume,
+            network: paymentData.metadata.network,
+            timestamp: new Date(paymentData.paid_at).getTime(),
+          },
+          timestamp: new Date().toISOString(),
+        })
+      }
+    } else if (paymentData.status === "pending") {
+      logger.info("Payment still pending", { reference })
+      return res.json({
+        status: "pending",
+        paymentStatus: "pending",
+        message: "Payment is being processed",
+        timestamp: new Date().toISOString(),
       })
     } else {
-      // Suspicious or failed payment
-      logTransaction("paystack_verify_error", {
-        reference,
-        paymentData,
-        error: "Payment verification failed or suspicious channel",
+      logger.info("Payment failed", { reference, status: paymentData.status })
+      return res.json({
+        status: "failed",
+        paymentStatus: "failed",
+        message: "Payment failed",
+        data: paymentData,
+        timestamp: new Date().toISOString(),
       })
-      res.status(400).json({ error: "Payment verification failed or suspicious channel", details: paymentData })
     }
   } catch (error) {
-    console.error("[Paystack verify] Payment verification error:", error.response?.data || error.message)
+    logger.error("Payment verification error", error, { reference })
 
-    logTransaction("paystack_verify_error", {
-      reference,
-      error: error.response?.data || error.message,
-    })
-
-    res.status(500).json({
-      error: "Payment verification failed",
-      details: error.response?.data || error.message,
-    })
-  }
-})
-
-// ✅ Get Transaction Status
-app.get("/api/transaction/:reference", async (req, res) => {
-  const { reference } = req.params
-
-  try {
-    // Try iShare transaction first
-    const ishareResponse = await fosterAPI.post("/fetch-ishare-transaction", {
-      transaction_id: reference,
-    })
-
-    res.json({
-      type: "ishare",
-      data: ishareResponse.data,
-    })
-  } catch (ishareError) {
-    try {
-      // Try other network transaction
-      const otherResponse = await fosterAPI.post("/fetch-other-network-transaction", {
-        transaction_id: reference,
-      })
-
-      res.json({
-        type: "other",
-        data: otherResponse.data,
-      })
-    } catch (otherError) {
-      res.status(404).json({
-        error: "Transaction not found",
-        reference,
+    // Check if it's a circuit breaker error
+    if (error.message.includes("Service temporarily unavailable")) {
+      return res.status(503).json({
+        status: "error",
+        message: "Payment verification service temporarily unavailable. Please try again in a few minutes.",
+        timestamp: new Date().toISOString(),
       })
     }
+
+    res.status(500).json({
+      status: "error",
+      message: "Payment verification failed",
+      timestamp: new Date().toISOString(),
+    })
+  } finally {
+    releaseTransactionLock(reference)
   }
 })
 
-// ✅ Error Handler
-app.use((err, req, res, next) => {
-  console.error("Global error handler:", err)
-  res.status(500).json({
-    error: "Internal server error",
-    message: err.message,
-  })
+app.post("/api/retry-transaction/:reference", async (req, res) => {
+  const { reference } = req.params
+  const { network, phone, volume } = req.body
+
+  logger.info("Transaction retry request", { reference, network, phone, volume })
+
+  if (!reference || !network || !phone || !volume) {
+    return res.status(400).json({
+      status: "error",
+      message: "Missing required parameters",
+    })
+  }
+
+  // Acquire lock for retry
+  if (!acquireTransactionLock(reference)) {
+    return res.status(409).json({
+      status: "error",
+      message: "Transaction is currently being processed",
+      retryAfter: 3,
+    })
+  }
+
+  try {
+    const verifyData = await verifyPaystackPayment(reference)
+
+    if (!verifyData.status || verifyData.data.status !== "success") {
+      return res.status(400).json({
+        status: "error",
+        message: "Cannot retry transaction - payment not successful",
+      })
+    }
+
+    const hubnetPayload = {
+      phone,
+      volume: volume.toString(),
+      reference,
+      referrer: phone,
+    }
+
+    let existingData = null
+    if (processedTransactions.has(reference)) {
+      existingData = processedTransactions.get(reference)
+      processedTransactions.add(reference, {
+        ...existingData,
+        retryAttempted: true,
+        retryTimestamp: Date.now(),
+      })
+    }
+
+    const hubnetData = await processHubnetTransaction(hubnetPayload, network)
+
+    logger.info("Transaction retry successful", { reference, transactionId: hubnetData.transaction_id })
+
+    res.json({
+      status: "success",
+      message: "Transaction retry completed",
+      data: {
+        reference,
+        phone,
+        volume,
+        network,
+        timestamp: Date.now(),
+        transaction_id: hubnetData.transaction_id || hubnetData.data?.transaction_id || "N/A",
+        hubnetResponse: hubnetData,
+        previousAttempt: existingData ? true : false,
+      },
+      timestamp: new Date().toISOString(),
+    })
+  } catch (error) {
+    logger.error("Transaction retry failed", error, { reference })
+    res.status(500).json({
+      status: "error",
+      message: "Transaction retry failed",
+      timestamp: new Date().toISOString(),
+    })
+  } finally {
+    releaseTransactionLock(reference)
+  }
 })
 
-// ✅ 404 Handler
+app.get("/api/transaction-status/:reference", async (req, res) => {
+  const { reference } = req.params
+
+  if (!reference) {
+    return res.status(400).json({
+      status: "error",
+      message: "Missing transaction reference",
+    })
+  }
+
+  logger.info("Transaction status check", { reference })
+
+  try {
+    if (processedTransactions.has(reference)) {
+      const metadata = processedTransactions.get(reference)
+
+      return res.json({
+        status: "success",
+        message: "Transaction status retrieved",
+        data: {
+          reference,
+          processed: true,
+          processedAt: metadata.processedAt || new Date(metadata.timestamp).toISOString(),
+          details: metadata,
+        },
+        timestamp: new Date().toISOString(),
+      })
+    } else {
+      try {
+        const verifyData = await verifyPaystackPayment(reference)
+
+        if (verifyData.status && verifyData.data.status === "success") {
+          return res.json({
+            status: "pending",
+            message: "Payment successful but data bundle not processed",
+            data: {
+              reference,
+              processed: false,
+              paymentStatus: "success",
+              paymentDetails: {
+                amount: verifyData.data.amount / 100,
+                phone: verifyData.data.metadata?.phone,
+                volume: verifyData.data.metadata?.volume,
+                network: verifyData.data.metadata?.network,
+                paidAt: verifyData.data.paid_at,
+              },
+            },
+            timestamp: new Date().toISOString(),
+          })
+        } else {
+          return res.json({
+            status: "pending",
+            message: "Payment not successful or pending",
+            data: {
+              reference,
+              processed: false,
+              paymentStatus: verifyData.data.status,
+            },
+            timestamp: new Date().toISOString(),
+          })
+        }
+      } catch (paymentError) {
+        logger.error("Error checking payment status", paymentError, { reference })
+        return res.json({
+          status: "unknown",
+          message: "Transaction reference not found",
+          data: {
+            reference,
+            processed: false,
+          },
+          timestamp: new Date().toISOString(),
+        })
+      }
+    }
+  } catch (error) {
+    logger.error("Error checking transaction status", error, { reference })
+    res.status(500).json({
+      status: "error",
+      message: "Failed to check transaction status",
+      timestamp: new Date().toISOString(),
+    })
+  }
+})
+
 app.use("*", (req, res) => {
   res.status(404).json({
-    error: "Endpoint not found",
+    status: "error",
+    message: "Endpoint not found",
     path: req.originalUrl,
   })
 })
 
-// ✅ Start Server
-const startServer = (attemptPort = port) => {
-  const server = app
-    .listen(attemptPort)
-    .on("error", (err) => {
-      if (err.code === "EADDRINUSE") {
-        console.log(`Port ${attemptPort} is busy, trying ${attemptPort + 1}...`)
-        startServer(attemptPort + 1)
+app.use((err, req, res, next) => {
+  logger.error("Unhandled error", err, { url: req.url, method: req.method })
+  res.status(err.status || 500).json({
+    status: "error",
+    message: "Server error occurred",
+  })
+})
+
+// Enhanced cleanup with better error handling
+setInterval(() => {
+  try {
+    const now = Date.now()
+    const windowStart = now - CONFIG.rateLimitWindow
+
+    for (const [clientId, requests] of rateLimitStore.entries()) {
+      const validRequests = requests.filter((time) => time > windowStart)
+      if (validRequests.length === 0) {
+        rateLimitStore.delete(clientId)
       } else {
-        console.error("Server error:", err)
-        process.exit(1)
+        rateLimitStore.set(clientId, validRequests)
       }
-    })
-    .on("listening", () => {
-      const actualPort = server.address().port
-      console.log(`🚀 Gigs Hub Server running at http://localhost:${actualPort}`)
-      console.log(`📊 Health check: http://localhost:${actualPort}/api/health`)
+    }
 
-      if (actualPort !== port) {
-        console.warn(`⚠️  Port ${port} was busy. Server started on port ${actualPort}`)
-        console.warn(`⚠️  Update your frontend to use port ${actualPort}`)
-      }
+    const cleanedTransactions = processedTransactions.cleanup()
+    if (cleanedTransactions > 0) {
+      logger.debug(`Cleaned up ${cleanedTransactions} expired transactions`)
+    }
+  } catch (error) {
+    logger.error("Error during cleanup", error)
+  }
+}, CONFIG.cacheCleanupInterval)
 
-      // Test Foster API connection
-      fosterAPI
-        .get("/check-console-balance")
-        .then(() => console.log("✅ Foster API connection successful"))
-        .catch(() => console.log("❌ Foster API connection failed - check API key"))
-    })
-}
+const server = app.listen(CONFIG.port, "0.0.0.0", () => {
+  logger.info(`🚀 PBM DATA HUB API Server v5.0 running on port ${CONFIG.port}`)
+  logger.info(`🌍 Environment: ${CONFIG.nodeEnv}`)
+  logger.info(`⚡ Optimized for Render hosting`)
+})
+
+server.keepAliveTimeout = CONFIG.keepAliveTimeout
+server.headersTimeout = CONFIG.headersTimeout
+server.timeout = CONFIG.requestTimeout
 
 // Graceful shutdown
 process.on("SIGTERM", () => {
-  console.log("SIGTERM received, shutting down gracefully")
-  process.exit(0)
+  logger.info("SIGTERM received, shutting down gracefully")
+  server.close(() => {
+    logger.info("Process terminated")
+    process.exit(0)
+  })
 })
 
-process.on("SIGINT", () => {
-  console.log("SIGINT received, shutting down gracefully")
-  process.exit(0)
-})
-
-startServer()
-
-module.exports = app
+export default app
