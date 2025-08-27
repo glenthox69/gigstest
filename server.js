@@ -750,7 +750,7 @@ app.post("/api/process-wallet-purchase", async (req, res) => {
   }
 
   try {
-    const prefix = network === "mtn" ? "MTN_PBM" : network === "at" ? "AT_PBM" : "BT_WALLET"
+    const prefix = network === "mtn" ? "MTN_DW" : network === "at" ? "AT_DW" : "BT_WALLET"
     const reference = generateReference(prefix)
 
     const hubnetPayload = {
@@ -1231,3 +1231,4 @@ process.on("SIGTERM", () => {
 })
 
 export default app
+
