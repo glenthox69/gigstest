@@ -18,6 +18,7 @@ const CONFIG = {
   baseUrl: process.env.BASE_URL || `http://localhost:${process.env.PORT || 3000}`,
   hubnetApiKey: process.env.HUBNET_API_KEY,
   paystackSecretKey: process.env.PAYSTACK_SECRET_KEY,
+  telecelApiKey: process.env.TELECEL_API_KEY,
   nodeEnv: process.env.NODE_ENV || "development",
 
   maxRetries: 1,
@@ -126,6 +127,9 @@ const securityHeaders = {
   "X-Powered-By": "PBM-DataHub",
   "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
   "X-DNS-Prefetch-Control": "off",
+  "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
+  "Pragma": "no-cache",
+  "Expires": "0",
 }
 
 app.use((req, res, next) => {
@@ -163,6 +167,68 @@ function rateLimit(req, res, next) {
 }
 
 app.use(rateLimit)
+
+// Request signature validation middleware for transaction endpoints
+function validateRequestSignature(req, res, next) {
+  const transactionEndpoints = [
+    '/api/process-wallet-purchase',
+    '/api/process-telecel-purchase',
+    '/api/verify-payment',
+    '/api/retry-transaction'
+  ]
+  
+  if (transactionEndpoints.some(endpoint => req.path.includes(endpoint))) {
+    // Validate request timestamp (prevent replay attacks)
+    const requestTime = Date.now()
+    const timestamp = req.headers['x-request-timestamp']
+    
+    if (timestamp) {
+      const timeDiff = Math.abs(requestTime - parseInt(timestamp))
+      if (timeDiff > 300000) { // 5 minutes
+        logger.warn("Request timestamp too old", { 
+          timestamp, 
+          requestTime, 
+          timeDiff, 
+          ip: req.ip,
+          path: req.path 
+        })
+        return res.status(400).json({
+          status: "error",
+          message: "Request timestamp too old",
+          timestamp: new Date().toISOString(),
+        })
+      }
+    }
+    
+    // Validate user agent
+    const userAgent = req.headers['user-agent']
+    if (!userAgent || userAgent.length < 10) {
+      logger.warn("Suspicious user agent", { 
+        userAgent, 
+        ip: req.ip, 
+        path: req.path 
+      })
+      return res.status(400).json({
+        status: "error",
+        message: "Invalid request",
+        timestamp: new Date().toISOString(),
+      })
+    }
+    
+    // Log transaction attempts for monitoring
+    logger.info("Transaction endpoint accessed", {
+      path: req.path,
+      method: req.method,
+      ip: req.ip,
+      userAgent: userAgent?.substring(0, 50),
+      timestamp: new Date().toISOString(),
+    })
+  }
+  
+  next()
+}
+
+app.use(validateRequestSignature)
 
 const publicDir = path.join(__dirname, "public")
 if (!fs.existsSync(publicDir)) {
@@ -239,8 +305,57 @@ class TransactionStore {
 
 const processedTransactions = new TransactionStore()
 
-// Enhanced transaction locking mechanism
+// Duplicate attempt monitoring
+const duplicateAttempts = new Map()
+const MAX_DUPLICATE_ATTEMPTS = 5
+const DUPLICATE_ATTEMPT_WINDOW = 10 * 60 * 1000 // 10 minutes
+
+function recordDuplicateAttempt(identifier, type = 'transaction') {
+  const key = `${type}_${identifier}`
+  const now = Date.now()
+  
+  if (!duplicateAttempts.has(key)) {
+    duplicateAttempts.set(key, [])
+  }
+  
+  const attempts = duplicateAttempts.get(key)
+  attempts.push(now)
+  
+  // Keep only attempts within the window
+  const validAttempts = attempts.filter(time => now - time < DUPLICATE_ATTEMPT_WINDOW)
+  duplicateAttempts.set(key, validAttempts)
+  
+  // Log suspicious activity
+  if (validAttempts.length >= MAX_DUPLICATE_ATTEMPTS) {
+    logger.error("SUSPICIOUS DUPLICATE ATTEMPTS DETECTED", {
+      identifier,
+      type,
+      attempts: validAttempts.length,
+      window: DUPLICATE_ATTEMPT_WINDOW,
+      timestamp: new Date().toISOString(),
+    })
+  }
+  
+  return validAttempts.length
+}
+
+function checkDuplicateAttempts(identifier, type = 'transaction') {
+  const key = `${type}_${identifier}`
+  const attempts = duplicateAttempts.get(key) || []
+  const now = Date.now()
+  const validAttempts = attempts.filter(time => now - time < DUPLICATE_ATTEMPT_WINDOW)
+  
+  return {
+    count: validAttempts.length,
+    isSuspicious: validAttempts.length >= MAX_DUPLICATE_ATTEMPTS,
+    lastAttempt: validAttempts.length > 0 ? validAttempts[validAttempts.length - 1] : null
+  }
+}
+
+// Enhanced transaction locking mechanism with multiple lock types
 const transactionLocks = new Map()
+const phoneTransactionLocks = new Map()
+const userTransactionLocks = new Map()
 
 function acquireTransactionLock(reference, timeout = 30000) {
   if (transactionLocks.has(reference)) {
@@ -254,18 +369,68 @@ function acquireTransactionLock(reference, timeout = 30000) {
   return true
 }
 
+function acquirePhoneTransactionLock(phone, volume, network, timeout = 45000) {
+  const phoneKey = `${phone}_${volume}_${network}`
+  if (phoneTransactionLocks.has(phoneKey)) {
+    const lockTime = phoneTransactionLocks.get(phoneKey)
+    if (Date.now() - lockTime < timeout) {
+      return false // Lock still active for this phone+volume+network
+    }
+  }
+
+  phoneTransactionLocks.set(phoneKey, Date.now())
+  return true
+}
+
+function acquireUserTransactionLock(userId, timeout = 30000) {
+  if (userTransactionLocks.has(userId)) {
+    const lockTime = userTransactionLocks.get(userId)
+    if (Date.now() - lockTime < timeout) {
+      return false // User has active transaction
+    }
+  }
+
+  userTransactionLocks.set(userId, Date.now())
+  return true
+}
+
 function releaseTransactionLock(reference) {
   transactionLocks.delete(reference)
+}
+
+function releasePhoneTransactionLock(phone, volume, network) {
+  const phoneKey = `${phone}_${volume}_${network}`
+  phoneTransactionLocks.delete(phoneKey)
+}
+
+function releaseUserTransactionLock(userId) {
+  userTransactionLocks.delete(userId)
 }
 
 // Cleanup expired locks periodically
 setInterval(() => {
   const now = Date.now()
   const timeout = 30000 // 30 seconds
+  const phoneTimeout = 45000 // 45 seconds for phone locks
 
+  // Cleanup transaction locks
   for (const [reference, lockTime] of transactionLocks.entries()) {
     if (now - lockTime > timeout) {
       transactionLocks.delete(reference)
+    }
+  }
+
+  // Cleanup phone transaction locks
+  for (const [phoneKey, lockTime] of phoneTransactionLocks.entries()) {
+    if (now - lockTime > phoneTimeout) {
+      phoneTransactionLocks.delete(phoneKey)
+    }
+  }
+
+  // Cleanup user transaction locks
+  for (const [userId, lockTime] of userTransactionLocks.entries()) {
+    if (now - lockTime > timeout) {
+      userTransactionLocks.delete(userId)
     }
   }
 }, 60000) // Run every minute
@@ -342,6 +507,7 @@ class CircuitBreaker {
 
 const paystackCircuitBreaker = new CircuitBreaker(3, 10000, "paystack")
 const hubnetCircuitBreaker = new CircuitBreaker(3, 15000, "hubnet")
+const telecelCircuitBreaker = new CircuitBreaker(3, 15000, "telecel")
 
 const fetchWithRetry = async (url, options = {}, config = {}) => {
   const {
@@ -492,6 +658,7 @@ async function checkHubnetBalance() {
 }
 
 async function processHubnetTransaction(payload, network) {
+  // Enhanced duplicate prevention - check reference first
   if (processedTransactions.has(payload.reference)) {
     const metadata = processedTransactions.get(payload.reference)
     if (metadata && metadata.hubnetResponse) {
@@ -513,54 +680,209 @@ async function processHubnetTransaction(payload, network) {
     }
   }
 
-  const apiUrl = `https://console.hubnet.app/live/api/context/business/transaction/${network}-new-transaction`
+  // Check for duplicate attempts
+  const duplicateCheck = checkDuplicateAttempts(`${payload.phone}_${payload.volume}_${network}`, 'phone_transaction')
+  if (duplicateCheck.isSuspicious) {
+    logger.error("Suspicious duplicate attempts detected", {
+      reference: payload.reference,
+      phone: payload.phone,
+      volume: payload.volume,
+      network,
+      attempts: duplicateCheck.count
+    })
+    throw new Error("SUSPICIOUS_ACTIVITY_DETECTED")
+  }
 
-  logger.info(`Processing Hubnet transaction`, { reference: payload.reference, network, apiUrl })
+  // Acquire phone-specific lock to prevent duplicate processing for same phone+volume+network
+  const phoneLockAcquired = acquirePhoneTransactionLock(payload.phone, payload.volume, network)
+  if (!phoneLockAcquired) {
+    logger.warn(`Phone transaction lock conflict`, { 
+      reference: payload.reference, 
+      phone: payload.phone, 
+      volume: payload.volume, 
+      network 
+    })
+    recordDuplicateAttempt(`${payload.phone}_${payload.volume}_${network}`, 'phone_transaction')
+    throw new Error("DUPLICATE_TRANSACTION_ATTEMPT")
+  }
 
-  const data = await fetchWithRetry(
-    apiUrl,
-    {
-      method: "POST",
-      headers: {
-        token: `Bearer ${CONFIG.hubnetApiKey}`,
-        "Content-Type": "application/json",
+  try {
+    const apiUrl = `https://console.hubnet.app/live/api/context/business/transaction/${network}-new-transaction`
+
+    logger.info(`Processing Hubnet transaction`, { reference: payload.reference, network, apiUrl })
+
+    const data = await fetchWithRetry(
+      apiUrl,
+      {
+        method: "POST",
+        headers: {
+          token: `Bearer ${CONFIG.hubnetApiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
       },
-      body: JSON.stringify(payload),
-    },
-    {
-      circuitBreaker: hubnetCircuitBreaker,
-      timeout: 15000,
-      maxRetries: 1,
-    },
-  )
+      {
+        circuitBreaker: hubnetCircuitBreaker,
+        timeout: 15000,
+        maxRetries: 1,
+      },
+    )
 
-  if (
-    data.event === "charge.rejected" &&
-    data.status === "failed" &&
-    data.message &&
-    data.message.includes("insufficient")
-  ) {
-    logger.error(`Insufficient Hubnet balance`, { reference: payload.reference })
-    throw new Error("INSUFFICIENT_HUBNET_BALANCE")
+    if (
+      data.event === "charge.rejected" &&
+      data.status === "failed" &&
+      data.message &&
+      data.message.includes("insufficient")
+    ) {
+      logger.error(`Insufficient Hubnet balance`, { reference: payload.reference })
+      throw new Error("INSUFFICIENT_HUBNET_BALANCE")
+    }
+
+    if (data.status === "failed") {
+      const errorMessage = data.message || data.reason || "Transaction failed"
+      logger.error(`Hubnet transaction failed`, { reference: payload.reference, error: errorMessage })
+      throw new Error(`Hubnet API error: ${errorMessage}`)
+    }
+
+    processedTransactions.add(payload.reference, {
+      network,
+      phone: payload.phone,
+      volume: payload.volume,
+      hubnetResponse: data,
+      processedAt: new Date().toISOString(),
+    })
+
+    logger.info(`Hubnet transaction successful`, { reference: payload.reference, transactionId: data.transaction_id })
+
+    return data
+  } finally {
+    // Always release the phone lock
+    releasePhoneTransactionLock(payload.phone, payload.volume, network)
   }
+}
 
-  if (data.status === "failed") {
-    const errorMessage = data.message || data.reason || "Transaction failed"
-    logger.error(`Hubnet transaction failed`, { reference: payload.reference, error: errorMessage })
-    throw new Error(`Hubnet API error: ${errorMessage}`)
-  }
-
-  processedTransactions.add(payload.reference, {
-    network,
-    phone: payload.phone,
-    volume: payload.volume,
-    hubnetResponse: data,
-    processedAt: new Date().toISOString(),
+async function processTelecelTransaction(payload) {
+  // Generate a unique request ID for tracking
+  const requestId = `${Date.now()}_${crypto.randomBytes(4).toString('hex')}`
+  logger.info("Starting Telecel transaction processing", {
+    requestId,
+    recipient: payload.recipient,
+    volume: payload.capacity,
+    reference: payload.reference
   })
 
-  logger.info(`Hubnet transaction successful`, { reference: payload.reference, transactionId: data.transaction_id })
+  // Enhanced duplicate prevention - check reference first
+  if (processedTransactions.has(payload.reference)) {
+    const metadata = processedTransactions.get(payload.reference)
+    if (metadata && metadata.telecelResponse) {
+      logger.info(`Telecel transaction already processed`, { 
+        requestId,
+        reference: payload.reference,
+        originalProcessingTime: metadata.processedAt 
+      })
+      return metadata.telecelResponse
+    }
+    return {
+      success: true,
+      message: "Already processed",
+      data: {
+        orderNumber: `TELECEL-${payload.reference}`,
+        reference: payload.reference,
+        status: "SUCCESSFUL",
+        network: "Telecel",
+        recipient: payload.recipient,
+        dataAmount: `${payload.capacity}GB`,
+        amountPaid: payload.amountPaid || 0,
+        orderDate: new Date().toISOString(),
+        statusDescription: "Order already processed.",
+      },
+    }
+  }
 
-  return data
+  // Check for duplicate attempts
+  const duplicateCheck = checkDuplicateAttempts(`${payload.recipient}_${payload.capacity}_telecel`, 'phone_transaction')
+  if (duplicateCheck.isSuspicious) {
+    logger.error("Suspicious duplicate attempts detected for Telecel", {
+      reference: payload.reference,
+      phone: payload.recipient,
+      volume: payload.capacity,
+      network: "telecel",
+      attempts: duplicateCheck.count
+    })
+    throw new Error("SUSPICIOUS_ACTIVITY_DETECTED")
+  }
+
+  // Acquire phone-specific lock to prevent duplicate processing for same phone+volume+network
+  const phoneLockAcquired = acquirePhoneTransactionLock(payload.recipient, payload.capacity, "telecel")
+  if (!phoneLockAcquired) {
+    logger.warn(`Telecel phone transaction lock conflict`, { 
+      reference: payload.reference, 
+      phone: payload.recipient, 
+      volume: payload.capacity, 
+      network: "telecel" 
+    })
+    recordDuplicateAttempt(`${payload.recipient}_${payload.capacity}_telecel`, 'phone_transaction')
+    throw new Error("DUPLICATE_TRANSACTION_ATTEMPT")
+  }
+
+  try {
+    const apiUrl = "https://console.ckgodsway.com/api/data-purchase"
+
+    // Convert MB to GB and format properly for Telecel API
+    const capacityInMB = parseInt(payload.capacity);
+    const capacityInGB = (capacityInMB / 1000).toFixed(1);
+
+    logger.info(`Processing Telecel transaction`, { 
+      reference: payload.reference, 
+      apiUrl, 
+      capacityMB: capacityInMB, 
+      capacityGB: capacityInGB 
+    })
+
+    const requestData = {
+      networkKey: "TELECEL",
+      recipient: payload.recipient,
+      capacity: capacityInGB,
+    }
+
+    const data = await fetchWithRetry(
+      apiUrl,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-API-Key": CONFIG.telecelApiKey,
+        },
+        body: JSON.stringify(requestData),
+      },
+      {
+        circuitBreaker: telecelCircuitBreaker,
+        timeout: 15000,
+        maxRetries: 1,
+      },
+    )
+
+    if (!data.success) {
+      const errorMessage = data.error || "Transaction failed"
+      logger.error(`Telecel transaction failed`, { reference: payload.reference, error: errorMessage })
+      throw new Error(`Telecel API error: ${errorMessage}`)
+    }
+
+    processedTransactions.add(payload.reference, {
+      network: "telecel",
+      phone: payload.recipient,
+      volume: payload.capacity,
+      telecelResponse: data,
+      processedAt: new Date().toISOString(),
+    })
+
+    logger.info(`Telecel transaction successful`, { reference: payload.reference, orderNumber: data.data.orderNumber })
+
+    return data
+  } finally {
+    // Always release the phone lock
+    releasePhoneTransactionLock(payload.recipient, payload.capacity, "telecel")
+  }
 }
 
 app.get("/health", (req, res) => {
@@ -574,9 +896,15 @@ app.get("/health", (req, res) => {
     services: {
       paystack: paystackCircuitBreaker.getState(),
       hubnet: hubnetCircuitBreaker.getState(),
+      telecel: telecelCircuitBreaker.getState(),
     },
     processedTransactions: processedTransactions._store.size,
-    activeLocks: transactionLocks.size,
+    security: {
+      activeTransactionLocks: transactionLocks.size,
+      activePhoneLocks: phoneTransactionLocks.size,
+      activeUserLocks: userTransactionLocks.size,
+      duplicateAttempts: duplicateAttempts.size,
+    },
   })
 })
 
@@ -602,6 +930,33 @@ app.get("/api/check-balance", async (req, res) => {
     res.status(500).json({
       status: "error",
       message: "Failed to retrieve balance",
+      timestamp: new Date().toISOString(),
+    })
+  }
+})
+
+app.post("/api/reset-circuit-breaker/:service", (req, res) => {
+  const { service } = req.params
+  
+  if (service === "telecel") {
+    telecelCircuitBreaker.state = "CLOSED"
+    telecelCircuitBreaker.failureCount = 0
+    telecelCircuitBreaker.lastFailureTime = null
+    telecelCircuitBreaker.successCount = 0
+    
+    logger.info(`Telecel circuit breaker manually reset`)
+    
+    res.json({
+      status: "success",
+      message: "Telecel circuit breaker reset successfully",
+      service: service,
+      state: telecelCircuitBreaker.getState(),
+      timestamp: new Date().toISOString(),
+    })
+  } else {
+    res.status(400).json({
+      status: "error",
+      message: "Invalid service. Only 'telecel' is supported",
       timestamp: new Date().toISOString(),
     })
   }
@@ -749,6 +1104,17 @@ app.post("/api/process-wallet-purchase", async (req, res) => {
     })
   }
 
+  // Acquire user lock to prevent multiple simultaneous transactions
+  const userLockAcquired = acquireUserTransactionLock(userId)
+  if (!userLockAcquired) {
+    logger.warn("User transaction lock conflict", { userId, phone, volume, network })
+    return res.status(409).json({
+      status: "error",
+      message: "You have a transaction in progress. Please wait.",
+      timestamp: new Date().toISOString(),
+    })
+  }
+
   try {
     const prefix = network === "mtn" ? "MTN_DW" : network === "at" ? "AT_DW" : "BT_WALLET"
     const reference = generateReference(prefix)
@@ -791,11 +1157,156 @@ app.post("/api/process-wallet-purchase", async (req, res) => {
       })
     }
 
+    if (hubnetError.message === "DUPLICATE_TRANSACTION_ATTEMPT") {
+      return res.status(409).json({
+        status: "error",
+        message: "Duplicate transaction attempt detected",
+        timestamp: new Date().toISOString(),
+      })
+    }
+
     res.status(500).json({
       status: "error",
       message: "Failed to process data bundle",
       timestamp: new Date().toISOString(),
     })
+  } finally {
+    // Always release the user lock
+    releaseUserTransactionLock(userId)
+  }
+})
+
+app.post("/api/process-telecel-purchase", async (req, res) => {
+  const { userId, network, phone, volume, amount, email, fcmToken, transactionKey } = req.body
+
+  logger.info("Telecel purchase request", { 
+    requestId: `${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
+    userId, 
+    network, 
+    phone, 
+    volume, 
+    amount 
+  })
+
+  if (!userId || !network || !phone || !volume || !amount || !email) {
+    return res.status(400).json({
+      status: "error",
+      message: "Missing required data",
+    })
+  }
+
+  if (network !== "telecel") {
+    return res.status(400).json({
+      status: "error",
+      message: "Invalid network for Telecel endpoint",
+    })
+  }
+
+  // Check if this exact transaction was recently processed
+  const requestKey = `${phone}_${volume}_${network}_${amount}`
+  const existingRequest = processedTransactions.get(requestKey)
+  if (existingRequest && (Date.now() - existingRequest.timestamp) < 300000) { // 5 minutes
+    logger.warn("Duplicate transaction attempt detected", {
+      requestKey,
+      originalTimestamp: existingRequest.timestamp,
+      timeSinceOriginal: Date.now() - existingRequest.timestamp
+    })
+    return res.status(409).json({
+      status: "error",
+      message: "This exact transaction was recently processed. Please wait before trying again.",
+      retryAfter: Math.ceil((300000 - (Date.now() - existingRequest.timestamp)) / 1000)
+    })
+  }
+
+  if (!/^\d{10}$/.test(phone)) {
+    return res.status(400).json({
+      status: "error",
+      message: "Invalid phone number",
+    })
+  }
+
+  const numAmount = Number(amount)
+  const numVolume = Number(volume)
+
+  if (isNaN(numAmount) || numAmount <= 0 || isNaN(numVolume) || numVolume <= 0) {
+    return res.status(400).json({
+      status: "error",
+      message: "Invalid amount or volume",
+    })
+  }
+
+  // Acquire user lock to prevent multiple simultaneous transactions
+  const userLockAcquired = acquireUserTransactionLock(userId)
+  if (!userLockAcquired) {
+    logger.warn("User transaction lock conflict for Telecel", { userId, phone, volume, network })
+    return res.status(409).json({
+      status: "error",
+      message: "You have a transaction in progress. Please wait.",
+      timestamp: new Date().toISOString(),
+    })
+  }
+
+  try {
+    const prefix = "TELECEL_DW"
+    const reference = generateReference(prefix)
+    
+    // Store request attempt in processedTransactions
+    const requestKey = `${phone}_${volume}_${network}_${amount}`
+    processedTransactions.add(requestKey, {
+      timestamp: Date.now(),
+      reference,
+      userId,
+      phone,
+      volume: numVolume,
+      amount: numAmount,
+      status: 'processing'
+    })
+
+    const telecelPayload = {
+      recipient: phone,
+      capacity: numVolume.toString(),
+      reference,
+      amountPaid: numAmount,
+    }
+
+    const telecelData = await processTelecelTransaction(telecelPayload)
+
+    logger.info("Telecel purchase successful", { reference, userId, network, phone, volume: numVolume })
+
+    res.json({
+      status: "success",
+      message: "Telecel transaction completed successfully",
+      data: {
+        reference: reference,
+        amount: numAmount,
+        phone: phone,
+        volume: numVolume,
+        network: network,
+        timestamp: Date.now(),
+        orderNumber: telecelData.data.orderNumber || `TELECEL-${reference}`,
+        telecelResponse: telecelData,
+      },
+      timestamp: new Date().toISOString(),
+    })
+  } catch (telecelError) {
+    logger.error("Telecel purchase failed", telecelError, { userId, network, phone, volume: numVolume })
+
+    if (telecelError.message === "DUPLICATE_TRANSACTION_ATTEMPT") {
+      return res.status(409).json({
+        status: "error",
+        message: "Duplicate transaction attempt detected",
+        timestamp: new Date().toISOString(),
+      })
+    }
+
+    res.status(500).json({
+      status: "error",
+      message: "Failed to process Telecel data bundle",
+      timestamp: new Date().toISOString(),
+    })
+  } finally {
+    // Always release the user lock
+    releaseUserTransactionLock(userId)
   }
 })
 
@@ -1193,6 +1704,7 @@ setInterval(() => {
     const now = Date.now()
     const windowStart = now - CONFIG.rateLimitWindow
 
+    // Cleanup rate limiting
     for (const [clientId, requests] of rateLimitStore.entries()) {
       const validRequests = requests.filter((time) => time > windowStart)
       if (validRequests.length === 0) {
@@ -1202,9 +1714,22 @@ setInterval(() => {
       }
     }
 
+    // Cleanup duplicate attempts
+    let cleanedDuplicateAttempts = 0
+    for (const [key, attempts] of duplicateAttempts.entries()) {
+      const validAttempts = attempts.filter((time) => now - time < DUPLICATE_ATTEMPT_WINDOW)
+      if (validAttempts.length === 0) {
+        duplicateAttempts.delete(key)
+        cleanedDuplicateAttempts++
+      } else {
+        duplicateAttempts.set(key, validAttempts)
+      }
+    }
+
+    // Cleanup processed transactions
     const cleanedTransactions = processedTransactions.cleanup()
-    if (cleanedTransactions > 0) {
-      logger.debug(`Cleaned up ${cleanedTransactions} expired transactions`)
+    if (cleanedTransactions > 0 || cleanedDuplicateAttempts > 0) {
+      logger.debug(`Cleanup: ${cleanedTransactions} expired transactions, ${cleanedDuplicateAttempts} duplicate attempt records`)
     }
   } catch (error) {
     logger.error("Error during cleanup", error)
@@ -1231,4 +1756,3 @@ process.on("SIGTERM", () => {
 })
 
 export default app
-
