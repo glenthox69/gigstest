@@ -83,6 +83,7 @@ app.use(
 const allowedOrigins = new Set([
   CONFIG.frontendUrl,
   "https://datawisegh.pro",
+  "https://gigstest.onrender.com",
   "https://datawise-f3e20.web.app",
 ])
 
@@ -1756,3 +1757,4 @@ process.on("SIGTERM", () => {
 })
 
 export default app
+
