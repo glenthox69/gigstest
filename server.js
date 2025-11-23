@@ -7,6 +7,32 @@ import fs from "fs"
 import cors from "cors"
 import compression from "compression"
 
+// ---------------- FIREBASE ADMIN (REALTIME DATABASE) ----------------
+import admin from "firebase-admin";
+
+const serviceAccount = {
+  "type": "service_account",
+  "project_id": "datawise-f3e20",
+  "private_key_id": "0b09923c2719b9ebab95cbf1eec0a4468e240701",
+  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCcsSf4q+YdiuFG\nXQ6/1UgXln6YScsYhZ/+Q8ySQdUAr3qmNVOZ5kEXqCtEiYr1djB9r6ep95LyDBj8\nkMJ11T6TAHnCIh8fWYOjucnWWcnwh06AMrvIWyZHEHcT8u5tNcWYE+2Z4y/qy/3V\nUtt0MjMwn0Y+X8RF+HEuMO+vsyjF3MaeEklb2SKTbIRyjWgoEycRihHRF00ymp9N\n7ye9dNakW0ObuNrdd3JvpbtCqBfmPYiLy+TzwH69LPTzmi8C2FJrs3S4zl9+OEAI\nM8ihsicKvJ9s2U4cPkVQ9q1M6tglo/bhW9Ee6nvo2ck7L1HTloa3zeDzrr0IBqP5\nL6kATiXdAgMBAAECggEANoXsjzqdiZUcW2QhMD5SZibPaUVwPtmseQj1g8UVjbYB\n+xjePNSivM0fNSuZJ12XdPys3ldQEhqEjUn/6ImpyvQk6hj+dGWtCUkqQwSeYKxs\nc+5zaj3RXXQMw2vKbEUEOy1gBabIsy6FZnf89ftL1bTud+DSBrjzBSwxExXH78Ue\nCPGsddUBCoEiHAU4HlConNow8lQ4mywfagQLxehx5zGpuTyxf0q5UC+GGjnQqhzZ\nyLu0eJ481Zb2sdDE3bsOH+Hw9o75ExdwxYw/sTh6+y3oQeCuyT6sVWTzBhwq5JaN\nbsxYp3ERMCsXGdgs6tMClJxfvb2O7btQ+BVJLJmTbwKBgQDNLXhfwiYDYCe3gWe2\nBDCbln+a7U3FjEbrHsue2uN8AXYz51yytHPpAfSYqRbOtHijv2SkLySHBOsva+FM\n9VCaAxT2CoNpnE3Q4kve3nvqGDkOxtapzvaXNQZggQ+gOc+Ef7V5r8wPHtbdf6E1\nSH48dS/c8cZJOF/W99NA4c/ZkwKBgQDDgSmh8KlC6kx6Toac2waqMzbmCtiAEs4x\nm+r0Ah2YXDAfuwYBzTevc5N8BEDcCPaEz5MjYAXzlFBibNkQxO2GDNjWXEFG1NZk\nVnOu/Wvt17DlT4hZ4vGMgme0Z5iXzGGZt/CVklCl4ZO0CUqDF24bcQIz1AwKxH71\nPtp0DbDozwKBgQC9ivb8B4BUd/zY4nvrwz0gTsz9U6IYEDnntSBIVU/32+XVlzOk\nh13Y8IyEhxhhxoj4RLR1lHN7JAkcWt3c2XcngBdaIGY8J0Af6x5J+mCg5tW3F+tx\nHZfiIgMNHc1QqHdToSMGEmhBw6ydHO3RKnIr6dpYkyYpuCGZloIbG0CHbwKBgHRX\ncMcFyDQh6dD+2eyOCrFOOOU8nwnYJwwulOsQNzxr39eCHFkGHpUyWhn7Df3i95Ch\nVhY/FkuVfyCTVbk893xGOOOXkuDr14luSPlhpdCsAoDzi1iyTLwo/j3FSHFNFue7\nJlhb8dJFIviIbucEEmoSHhVpoqDlvgeDl8xoOVbRAoGAMaBG6roXRYN1D2zFybfT\noHHeXD9PMdvD3mW1aiMsQaPVFIPVZ7qLT/p8kZ7hvNhz4P58x4to0sxOTj7gBCjn\nVrt6fnpWwOyzEw5UCVzkkxohVyDj7l4p/x9kWfaVFMJVLdhcFGUm4aN/qjqLssFZ\nihCaTJ1+GFdMuCo/sqAcfYE=\n-----END PRIVATE KEY-----\n",
+  "client_email": "firebase-adminsdk-fbsvc@datawise-f3e20.iam.gserviceaccount.com",
+  "client_id": "101845840048598688212",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/firebase-adminsdk-fbsvc%40datawise-f3e20.iam.gserviceaccount.com",
+  "universe_domain": "googleapis.com"
+};
+
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+    databaseURL: "https://datawise-f3e20-default-rtdb.firebaseio.com",
+  });
+}
+
+const db = admin.database();
+
 dotenv.config()
 
 const __filename = fileURLToPath(import.meta.url)
@@ -83,8 +109,7 @@ app.use(
 const allowedOrigins = new Set([
   CONFIG.frontendUrl,
   "https://datawisegh.pro",
-  "https://gigstest.onrender.com",
-  "https://datawise-f3e20.web.app",
+  "https://nityhub.online"
 ])
 
 app.use(
@@ -323,7 +348,7 @@ function recordDuplicateAttempt(identifier, type = 'transaction') {
   attempts.push(now)
   
   // Keep only attempts within the window
-  const validAttempts = attempts.filter(time => now - time < DUPLICATE_ATTEMPT_WINDOW)
+  const validAttempts = attempts.filter(time => now - time < DUPLICATE_ATTEMT_WINDOW)
   duplicateAttempts.set(key, validAttempts)
   
   // Log suspicious activity
@@ -344,7 +369,7 @@ function checkDuplicateAttempts(identifier, type = 'transaction') {
   const key = `${type}_${identifier}`
   const attempts = duplicateAttempts.get(key) || []
   const now = Date.now()
-  const validAttempts = attempts.filter(time => now - time < DUPLICATE_ATTEMPT_WINDOW)
+  const validAttempts = attempts.filter(time => now - time < DUPLICATE_ATTEMT_WINDOW)
   
   return {
     count: validAttempts.length,
@@ -658,6 +683,153 @@ async function checkHubnetBalance() {
   )
 }
 
+app.post("/webhook", express.json(), async (req, res) => {
+  try {
+    const payload = req.body;
+
+    if (!payload?.data?.reference) {
+      return res.status(400).json({ status: false, message: "Invalid webhook format" });
+    }
+
+    const { reference, status, msisdn, network, volume } = payload.data;
+    const updatedAt = new Date().toISOString();
+
+    // Search all users' orders for the order with this reference
+    const ordersRoot = db.ref("orders");
+    let found = false;
+    let updatedUserId = null;
+    let updatedOrderId = null;
+
+    // Fetch all orders (could be optimized for large DBs)
+    const ordersSnapshot = await ordersRoot.once("value");
+    if (ordersSnapshot.exists()) {
+      const ordersData = ordersSnapshot.val();
+      for (const userId in ordersData) {
+        const userOrders = ordersData[userId];
+        for (const orderId in userOrders) {
+          const order = userOrders[orderId];
+          if (order && order.reference === reference) {
+            // Update this order
+            const orderRef = db.ref(`orders/${userId}/${orderId}`);
+            await orderRef.update({
+              status,
+              network,
+              phone: msisdn,
+              volume,
+              updatedAt,
+            });
+            found = true;
+            updatedUserId = userId;
+            updatedOrderId = orderId;
+            break;
+          }
+        }
+        if (found) break;
+      }
+    }
+
+    // If not found, optionally create a new order (not typical, but fallback)
+    if (!found) {
+      // You may want to log this as a warning
+      console.warn(`[WEBHOOK] Order reference ${reference} not found in any user's orders. No update performed.`);
+    }
+
+    // Also keep in-memory cache if needed
+    processedTransactions.add(reference, {
+      reference,
+      phone: msisdn,
+      network,
+      volume,
+      status,
+      updatedFrom: "webhook",
+      updatedAt,
+    });
+
+    console.log(`[WEBHOOK] Order ${reference} updated: ${status}`);
+    res.status(200).json({ status: true, message: found ? "Webhook processed and order updated" : "Order not found, no update performed" });
+  } catch (error) {
+    console.error("Webhook processing failed:", error);
+    res.status(500).json({ status: false, message: "Webhook processing failed" });
+  }
+});
+
+// Update transaction status endpoint
+app.get("/api/transaction-status/:reference", async (req, res) => {
+  const { reference } = req.params;
+
+  if (!reference) {
+    return res.status(400).json({
+      status: "error", 
+      message: "Missing transaction reference"
+    });
+  }
+
+  logger.info("Transaction status check", { reference });
+
+  try {
+    if (processedTransactions.has(reference)) {
+      const metadata = processedTransactions.get(reference);
+      
+      return res.json({
+        status: "success",
+        message: "Transaction status retrieved",
+        data: {
+          reference,
+          hubnetStatus: metadata.status || "Processing",
+          network: metadata.network,
+          phone: metadata.phone,
+          volume: metadata.volume,
+          updatedAt: metadata.updatedAt,
+          updatedFrom: metadata.updatedFrom
+        },
+        timestamp: new Date().toISOString()
+      });
+    }
+
+    // If not found in memory, check payment status
+    const verifyData = await verifyPaystackPayment(reference);
+
+    if (verifyData.status && verifyData.data.status === "success") {
+      return res.json({
+        status: "pending",
+        message: "Payment verified, awaiting Hubnet confirmation",
+        data: {
+          reference,
+          hubnetStatus: "Processing",
+          paymentStatus: "success",
+          paymentDetails: {
+            amount: verifyData.data.amount / 100,
+            phone: verifyData.data.metadata?.phone,
+            volume: verifyData.data.metadata?.volume,
+            network: verifyData.data.metadata?.network,
+            paidAt: verifyData.data.paid_at
+          }
+        },
+        timestamp: new Date().toISOString()
+      });
+    }
+
+    res.json({
+      status: "pending",
+      message: "Awaiting Hubnet response",
+      data: { 
+        reference,
+        hubnetStatus: "Pending",
+        paymentStatus: verifyData.data?.status || "unknown"
+      },
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    logger.error("Error checking transaction status", error, { reference });
+    res.status(500).json({
+      status: "error",
+      message: "Failed to check transaction status",
+      timestamp: new Date().toISOString()
+    });
+  }
+})
+
+// Update Hubnet payload to include webhook
 async function processHubnetTransaction(payload, network) {
   // Enhanced duplicate prevention - check reference first
   if (processedTransactions.has(payload.reference)) {
@@ -712,6 +884,12 @@ async function processHubnetTransaction(payload, network) {
 
     logger.info(`Processing Hubnet transaction`, { reference: payload.reference, network, apiUrl })
 
+    // Add webhook URL to payload
+    const hubnetPayload = {
+      ...payload,
+      webhook: "https://gigstest.onrender.com/webhook"
+    };
+
     const data = await fetchWithRetry(
       apiUrl,
       {
@@ -720,7 +898,7 @@ async function processHubnetTransaction(payload, network) {
           token: `Bearer ${CONFIG.hubnetApiKey}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify(payload),
+        body: JSON.stringify(hubnetPayload),
       },
       {
         circuitBreaker: hubnetCircuitBreaker,
@@ -763,24 +941,11 @@ async function processHubnetTransaction(payload, network) {
 }
 
 async function processTelecelTransaction(payload) {
-  // Generate a unique request ID for tracking
-  const requestId = `${Date.now()}_${crypto.randomBytes(4).toString('hex')}`
-  logger.info("Starting Telecel transaction processing", {
-    requestId,
-    recipient: payload.recipient,
-    volume: payload.capacity,
-    reference: payload.reference
-  })
-
   // Enhanced duplicate prevention - check reference first
   if (processedTransactions.has(payload.reference)) {
     const metadata = processedTransactions.get(payload.reference)
     if (metadata && metadata.telecelResponse) {
-      logger.info(`Telecel transaction already processed`, { 
-        requestId,
-        reference: payload.reference,
-        originalProcessingTime: metadata.processedAt 
-      })
+      logger.info(`Telecel transaction already processed`, { reference: payload.reference })
       return metadata.telecelResponse
     }
     return {
@@ -1117,7 +1282,7 @@ app.post("/api/process-wallet-purchase", async (req, res) => {
   }
 
   try {
-    const prefix = network === "mtn" ? "MTN_DW" : network === "at" ? "AT_DW" : "BT_WALLET"
+    const prefix = network === "mtn" ? "MTN_PBM" : network === "at" ? "AT_PBM" : "BT_WALLET"
     const reference = generateReference(prefix)
 
     const hubnetPayload = {
@@ -1180,14 +1345,7 @@ app.post("/api/process-wallet-purchase", async (req, res) => {
 app.post("/api/process-telecel-purchase", async (req, res) => {
   const { userId, network, phone, volume, amount, email, fcmToken, transactionKey } = req.body
 
-  logger.info("Telecel purchase request", { 
-    requestId: `${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
-    userId, 
-    network, 
-    phone, 
-    volume, 
-    amount 
-  })
+  logger.info("Telecel purchase request", { userId, network, phone, volume, amount })
 
   if (!userId || !network || !phone || !volume || !amount || !email) {
     return res.status(400).json({
@@ -1200,22 +1358,6 @@ app.post("/api/process-telecel-purchase", async (req, res) => {
     return res.status(400).json({
       status: "error",
       message: "Invalid network for Telecel endpoint",
-    })
-  }
-
-  // Check if this exact transaction was recently processed
-  const requestKey = `${phone}_${volume}_${network}_${amount}`
-  const existingRequest = processedTransactions.get(requestKey)
-  if (existingRequest && (Date.now() - existingRequest.timestamp) < 300000) { // 5 minutes
-    logger.warn("Duplicate transaction attempt detected", {
-      requestKey,
-      originalTimestamp: existingRequest.timestamp,
-      timeSinceOriginal: Date.now() - existingRequest.timestamp
-    })
-    return res.status(409).json({
-      status: "error",
-      message: "This exact transaction was recently processed. Please wait before trying again.",
-      retryAfter: Math.ceil((300000 - (Date.now() - existingRequest.timestamp)) / 1000)
     })
   }
 
@@ -1248,20 +1390,8 @@ app.post("/api/process-telecel-purchase", async (req, res) => {
   }
 
   try {
-    const prefix = "TELECEL_DW"
+    const prefix = "TELECEL_PBM"
     const reference = generateReference(prefix)
-    
-    // Store request attempt in processedTransactions
-    const requestKey = `${phone}_${volume}_${network}_${amount}`
-    processedTransactions.add(requestKey, {
-      timestamp: Date.now(),
-      reference,
-      userId,
-      phone,
-      volume: numVolume,
-      amount: numAmount,
-      status: 'processing'
-    })
 
     const telecelPayload = {
       recipient: phone,
@@ -1718,7 +1848,7 @@ setInterval(() => {
     // Cleanup duplicate attempts
     let cleanedDuplicateAttempts = 0
     for (const [key, attempts] of duplicateAttempts.entries()) {
-      const validAttempts = attempts.filter((time) => now - time < DUPLICATE_ATTEMPT_WINDOW)
+      const validAttempts = attempts.filter((time) => now - time < DUPLICATE_ATTEMT_WINDOW)
       if (validAttempts.length === 0) {
         duplicateAttempts.delete(key)
         cleanedDuplicateAttempts++
@@ -1738,7 +1868,7 @@ setInterval(() => {
 }, CONFIG.cacheCleanupInterval)
 
 const server = app.listen(CONFIG.port, "0.0.0.0", () => {
-  logger.info(`🚀 PBM DATA HUB API Server v5.0 running on port ${CONFIG.port}`)
+  logger.info(`🚀 DataWise API Server v5.0 running on port ${CONFIG.port}`)
   logger.info(`🌍 Environment: ${CONFIG.nodeEnv}`)
   logger.info(`⚡ Optimized for Render hosting`)
 })
@@ -1757,4 +1887,3 @@ process.on("SIGTERM", () => {
 })
 
 export default app
-
